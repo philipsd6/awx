@@ -15,7 +15,7 @@ __all__ = ['skip_directory', 'could_be_playbook', 'could_be_inventory']
 
 
 valid_playbook_re = re.compile(r'^\s*?-?\s*?(?:hosts|include|import_playbook):\s*?.*?$')
-valid_inventory_re = re.compile(r'^[a-zA-Z0-9_.=\[\]]')
+valid_inventory_re = re.compile(r'^[# {},a-zA-Z0-9_.=\[\]]')
 
 
 def skip_directory(relative_directory_path):
@@ -77,6 +77,9 @@ def could_be_inventory(project_path, dir_path, filename):
     elif suspected_ext == '.ini' or os.access(inventory_path, os.X_OK):
         # Files with any of these extensions are always included
         return inventory_rel_path
+    elif suspected_ext in ['.yaml', '.yml', '.json']:
+        # Might be an inventory plugin file
+        pass
     elif '.' in suspected_ext:
         # If not using those extensions, inventory must have _no_ extension
         return None
@@ -92,6 +95,9 @@ def could_be_inventory(project_path, dir_path, filename):
             errors='ignore'
         ) as inv_file:
             for line in islice(inv_file, 10):
+                if 'plugin:' in line or 'all' in line:
+                    # Probably an inventory file
+                    return inventory_rel_path
                 if not valid_inventory_re.match(line):
                     return None
     except IOError:

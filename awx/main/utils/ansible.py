@@ -100,6 +100,8 @@ def could_be_inventory(project_path, dir_path, filename):
                     return inventory_rel_path
                 if not valid_inventory_re.match(line):
                     return None
+            else:
+                return None
     except IOError:
         return None
     return inventory_rel_path

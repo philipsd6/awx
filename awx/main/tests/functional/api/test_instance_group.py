@@ -33,13 +33,6 @@ def node_type_instance():
 
 
 @pytest.fixture
-def instance_group(job_factory):
-    ig = InstanceGroup(name="east")
-    ig.save()
-    return ig
-
-
-@pytest.fixture
 def containerized_instance_group(instance_group, kube_credential):
     ig = InstanceGroup(name="container")
     ig.credential = kube_credential
@@ -109,7 +102,7 @@ def test_delete_instance_group_jobs_running(delete, instance_group_jobs_running,
     response_sorted = sorted(response.data['active_jobs'], key=sort_keys)
     expect_sorted = sorted(expect_transformed, key=sort_keys)
 
-    assert response.data['error'] == u"Resource is being used by running jobs."
+    assert response.data['error'] == "Resource is being used by running jobs."
     assert response_sorted == expect_sorted
 
 

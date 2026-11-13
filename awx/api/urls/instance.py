@@ -10,9 +10,9 @@ from awx.api.views import (
     InstanceInstanceGroupsList,
     InstanceHealthCheck,
     InstancePeersList,
+    InstanceReceptorAddressesList,
 )
 from awx.api.views.instance_install_bundle import InstanceInstallBundle
-
 
 urls = [
     re_path(r'^$', InstanceList.as_view(), name='instance_list'),
@@ -21,6 +21,7 @@ urls = [
     re_path(r'^(?P<pk>[0-9]+)/instance_groups/$', InstanceInstanceGroupsList.as_view(), name='instance_instance_groups_list'),
     re_path(r'^(?P<pk>[0-9]+)/health_check/$', InstanceHealthCheck.as_view(), name='instance_health_check'),
     re_path(r'^(?P<pk>[0-9]+)/peers/$', InstancePeersList.as_view(), name='instance_peers_list'),
+    re_path(r'^(?P<pk>[0-9]+)/receptor_addresses/$', InstanceReceptorAddressesList.as_view(), name='instance_receptor_addresses_list'),
     re_path(r'^(?P<pk>[0-9]+)/install_bundle/$', InstanceInstallBundle.as_view(), name='instance_install_bundle'),
 ]
 

@@ -5,6 +5,8 @@
 import datetime
 import os
 import urllib.parse as urlparse
+from uuid import uuid4
+import logging
 
 # Django
 from django.conf import settings
@@ -14,7 +16,6 @@ from django.utils.encoding import smart_str
 from django.utils.text import slugify
 from django.core.exceptions import ValidationError
 from django.utils.timezone import now, make_aware, get_default_timezone
-
 
 # AWX
 from awx.api.versioning import reverse
@@ -29,15 +30,17 @@ from awx.main.models.unified_jobs import (
     UnifiedJobTemplate,
 )
 from awx.main.models.jobs import Job
-from awx.main.models.mixins import ResourceMixin, TaskManagerProjectUpdateMixin, CustomVirtualEnvMixin, RelatedJobsMixin
+from awx.main.models.mixins import TaskManagerProjectUpdateMixin, CustomVirtualEnvMixin, RelatedJobsMixin
 from awx.main.utils import update_scm_url, polymorphic
 from awx.main.utils.ansible import skip_directory, could_be_inventory, could_be_playbook
 from awx.main.utils.execution_environments import get_control_plane_execution_environment
-from awx.main.fields import ImplicitRoleField, JSONBlob
+from awx.main.fields import ImplicitRoleField
 from awx.main.models.rbac import (
     ROLE_SINGLETON_SYSTEM_ADMINISTRATOR,
     ROLE_SINGLETON_SYSTEM_AUDITOR,
 )
+
+logger = logging.getLogger('awx.main.models.projects')
 
 __all__ = ['Project', 'ProjectUpdate']
 
@@ -74,7 +77,7 @@ class ProjectOptions(models.Model):
             return []
 
     local_path = models.CharField(
-        max_length=1024, blank=True, help_text=_('Local path (relative to PROJECTS_ROOT) containing ' 'playbooks and related files for this project.')
+        max_length=1024, blank=True, help_text=_('Local path (relative to PROJECTS_ROOT) containing playbooks and related files for this project.')
     )
 
     scm_type = models.CharField(
@@ -246,7 +249,7 @@ class ProjectOptions(models.Model):
         return proj_path + '.lock'
 
 
-class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEnvMixin, RelatedJobsMixin):
+class Project(UnifiedJobTemplate, ProjectOptions, CustomVirtualEnvMixin, RelatedJobsMixin):
     """
     A project represents a playbook git repo that can access a set of inventories
     """
@@ -259,6 +262,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
     class Meta:
         app_label = 'main'
         ordering = ('id',)
+        permissions = [('update_project', 'Can run a project update'), ('use_project', 'Can use project in a job template')]
 
     default_environment = models.ForeignKey(
         'ExecutionEnvironment',
@@ -276,11 +280,11 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
     scm_update_cache_timeout = models.PositiveIntegerField(
         default=0,
         blank=True,
-        help_text=_('The number of seconds after the last project update ran that a new ' 'project update will be launched as a job dependency.'),
+        help_text=_('The number of seconds after the last project update ran that a new project update will be launched as a job dependency.'),
     )
     allow_override = models.BooleanField(
         default=False,
-        help_text=_('Allow changing the SCM branch or revision in a job template ' 'that uses this project.'),
+        help_text=_('Allow changing the SCM branch or revision in a job template that uses this project.'),
     )
 
     # credential (keys) used to validate content signature
@@ -303,7 +307,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         help_text=_('The last revision fetched by a project update'),
     )
 
-    playbook_files = JSONBlob(
+    playbook_files = models.JSONField(
         default=list,
         blank=True,
         editable=False,
@@ -311,7 +315,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         help_text=_('List of playbooks found in the project'),
     )
 
-    inventory_files = JSONBlob(
+    inventory_files = models.JSONField(
         default=list,
         blank=True,
         editable=False,
@@ -363,12 +367,12 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         pre_save_vals = getattr(self, '_prior_values_store', {})
         # If update_fields has been specified, add our field names to it,
         # if it hasn't been specified, then we're just doing a normal save.
-        update_fields = kwargs.get('update_fields', [])
+        update_fields = kwargs.get('update_fields') or []
         self._skip_update = bool(kwargs.pop('skip_update', False))
         # Create auto-generated local path if project uses SCM.
         if self.pk and self.scm_type and not self.local_path.startswith('_'):
-            slug_name = slugify(str(self.name)).replace(u'-', u'_')
-            self.local_path = u'_%d__%s' % (int(self.pk), slug_name)
+            slug_name = slugify(str(self.name)).replace('-', '_')
+            self.local_path = '_%d__%s' % (int(self.pk), slug_name)
             if 'local_path' not in update_fields:
                 update_fields.append('local_path')
         # Do the actual save.
@@ -446,7 +450,26 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
 
     @property
     def cache_id(self):
-        return str(self.last_job_id)
+        # Prefer scm_revision as the cache key if available. This guarantees that project changes are tracked correctly
+        # even over multiple nodes. The scm_revision is a hex string and thus safe to be used as a directory name.
+        if self.scm_revision:
+            return self.scm_revision
+
+        # If no scm_revision is available (e.g. non-scm projects), use these. current_job_id and last_job_id are global
+        # IDs in the database. This means that when a project sync runs on one node, all other nodes become outdated,
+        # resulting in unnecessary re-syncs.
+        if self.current_job_id:
+            return str(self.current_job_id)
+        elif self.last_job_id:
+            return str(self.last_job_id)
+        elif self.last_job_run:
+            return self.last_job_run.isoformat()
+        else:
+            logger.warning(f'No info about last update for project {self.id}, content cache may misbehave')
+            if self.modified:
+                return self.modified.isoformat()
+            else:
+                return str(uuid4())
 
     @property
     def notification_templates(self):
@@ -479,7 +502,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         RunProjectUpdate/RunInventoryUpdate.
         """
 
-        if self.status not in ('error', 'failed'):
+        if self.status not in ('error', 'failed') or self.scm_update_on_launch:
             return None
 
         latest_update = self.project_updates.last()
@@ -552,7 +575,7 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
     def _get_parent_field_name(self):
         return 'project'
 
-    def _update_parent_instance(self):
+    def _update_parent_instance(self, skip_locked=False):
         if not self.project:
             return  # no parent instance to update
         if self.job_type == PERM_INVENTORY_DEPLOY:
@@ -565,7 +588,7 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
                 first_update = True
             if not first_update:
                 return
-        return super(ProjectUpdate, self)._update_parent_instance()
+        return super(ProjectUpdate, self)._update_parent_instance(skip_locked=skip_locked)
 
     @classmethod
     def _get_task_class(cls):
@@ -616,8 +639,8 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
 
     @property
     def cache_id(self):
-        if self.branch_override or self.job_type == 'check' or (not self.project):
-            return str(self.id)
+        if self.branch_override or (not self.project):
+            return str(self.id)  # causes it to not use the cache, basically
         return self.project.cache_id
 
     def result_stdout_raw_limited(self, start_line=0, end_line=None, redact_sensitive=True):
@@ -630,7 +653,7 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
         return reverse('api:project_update_detail', kwargs={'pk': self.pk}, request=request)
 
     def get_ui_url(self):
-        return urlparse.urljoin(settings.TOWER_URL_BASE, "/#/jobs/project/{}".format(self.pk))
+        return urlparse.urljoin(settings.TOWER_URL_BASE, "{}/jobs/project/{}".format(settings.OPTIONAL_UI_URL_PREFIX, self.pk))
 
     def cancel(self, job_explanation=None, is_chain=False):
         res = super(ProjectUpdate, self).cancel(job_explanation=job_explanation, is_chain=is_chain)

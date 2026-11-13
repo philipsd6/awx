@@ -56,7 +56,7 @@ def test_organization_list_access_tests(options, head, get, admin, alice):
 
 
 @pytest.mark.django_db
-def test_organization_access_tests(organization, get, admin, alice, bob):
+def test_organization_access_tests(organization, get, admin, alice, bob, setup_managed_roles):
     organization.member_role.members.add(alice)
     get(reverse('api:organization_detail', kwargs={'pk': organization.id}), user=admin, expect=200)
     get(reverse('api:organization_detail', kwargs={'pk': organization.id}), user=alice, expect=200)
@@ -65,14 +65,14 @@ def test_organization_access_tests(organization, get, admin, alice, bob):
 
 
 @pytest.mark.django_db
-def test_organization_list_integrity(organization, get, admin, alice):
+def test_organization_list_integrity(organization, get, admin, alice, setup_managed_roles):
     res = get(reverse('api:organization_list'), user=admin)
     for field in ['id', 'url', 'name', 'description', 'created']:
         assert field in res.data['results'][0]
 
 
 @pytest.mark.django_db
-def test_organization_list_order_integrity(organizations, get, admin):
+def test_organization_list_order_integrity(organizations, get, admin, setup_managed_roles):
     # check that the order of the organization list retains integrity.
     orgs = organizations(4)
     org_ids = {}
@@ -83,7 +83,7 @@ def test_organization_list_order_integrity(organizations, get, admin):
 
 
 @pytest.mark.django_db
-def test_organization_list_visibility(organizations, get, admin, alice):
+def test_organization_list_visibility(organizations, get, admin, alice, setup_managed_roles):
     orgs = organizations(2)
 
     res = get(reverse('api:organization_list'), user=admin)
@@ -151,7 +151,7 @@ def test_organization_inventory_list_order_integrity(organization, admin, invent
 
 
 @pytest.mark.django_db
-def test_create_organization(post, admin, alice):
+def test_create_organization(post, admin, alice, setup_managed_roles):
     new_org = {'name': 'new org', 'description': 'my description'}
     res = post(reverse('api:organization_list'), new_org, user=admin, expect=201)
     assert res.data['name'] == new_org['name']
@@ -197,7 +197,7 @@ def test_add_admin_to_organization_xfail(post, organization, alice, bob):
 
 
 @pytest.mark.django_db
-def test_update_organization(get, put, organization, alice, bob):
+def test_update_organization(get, put, organization, alice, bob, setup_managed_roles):
     organization.admin_role.members.add(alice)
     data = get(reverse('api:organization_detail', kwargs={'pk': organization.id}), user=alice, expect=200).data
     data['description'] = 'hi'
@@ -209,7 +209,7 @@ def test_update_organization(get, put, organization, alice, bob):
 
 
 @pytest.mark.django_db
-def test_update_organization_max_hosts(get, put, organization, admin, alice, bob):
+def test_update_organization_max_hosts(get, put, organization, admin, alice, bob, setup_managed_roles):
     # Admin users can get and update max_hosts
     data = get(reverse('api:organization_detail', kwargs={'pk': organization.id}), user=admin, expect=200).data
     assert organization.max_hosts == 0
@@ -272,7 +272,7 @@ def test_organization_delete_with_active_jobs(delete, admin, organization, organ
     resp_sorted = sorted(resp.data['active_jobs'], key=sort_keys)
     expect_sorted = sorted(expect_transformed, key=sort_keys)
 
-    assert resp.data['error'] == u"Resource is being used by running jobs."
+    assert resp.data['error'] == "Resource is being used by running jobs."
     assert resp_sorted == expect_sorted
 
 
@@ -329,3 +329,21 @@ def test_galaxy_credential_association(alice, admin, organization, post, get):
         'Public Galaxy 4',
         'Public Galaxy 5',
     ]
+
+
+@pytest.mark.django_db
+def test_org_admin_credential_count(org_admin, admin, organization, post, get):
+    galaxy = CredentialType.defaults['galaxy_api_token']()
+    galaxy.save()
+
+    for i in range(3):
+        cred = Credential.objects.create(credential_type=galaxy, name=f'test_{i}', inputs={'url': 'https://galaxy.ansible.com/'})
+        url = reverse('api:organization_galaxy_credentials_list', kwargs={'pk': organization.pk})
+        post(url, {'associate': True, 'id': cred.pk}, user=admin, expect=204)
+    # org admin should see all associated galaxy credentials
+    resp = get(url, user=org_admin)
+    assert resp.data['count'] == 3
+    # removing one to validate new count
+    post(url, {'disassociate': True, 'id': Credential.objects.get(name='test_1').pk}, user=admin, expect=204)
+    resp_new = get(url, user=org_admin)
+    assert resp_new.data['count'] == 2

@@ -39,11 +39,6 @@ def runtime_data(organization, credentialtype_ssh):
 
 
 @pytest.fixture
-def job_with_links(machine_credential, inventory):
-    return Job.objects.create(name='existing-job', credential=machine_credential, inventory=inventory)
-
-
-@pytest.fixture
 def job_template_prompts(project, inventory, machine_credential):
     def rf(on_off):
         jt = JobTemplate.objects.create(
@@ -131,11 +126,11 @@ def test_job_ignore_unprompted_vars(runtime_data, job_template_prompts, post, ad
 
     mock_job = mocker.MagicMock(spec=Job, id=968, **runtime_data)
 
-    with mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job):
-        with mocker.patch('awx.api.serializers.JobSerializer.to_representation'):
-            response = post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), runtime_data, admin_user, expect=201)
-            assert JobTemplate.create_unified_job.called
-            assert JobTemplate.create_unified_job.call_args == ()
+    mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation')
+    response = post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), runtime_data, admin_user, expect=201)
+    assert JobTemplate.create_unified_job.called
+    assert JobTemplate.create_unified_job.call_args == ()
 
     # Check that job is serialized correctly
     job_id = response.data['job']
@@ -167,12 +162,12 @@ def test_job_accept_prompted_vars(runtime_data, job_template_prompts, post, admi
 
     mock_job = mocker.MagicMock(spec=Job, id=968, **runtime_data)
 
-    with mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job):
-        with mocker.patch('awx.api.serializers.JobSerializer.to_representation'):
-            response = post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), runtime_data, admin_user, expect=201)
-            assert JobTemplate.create_unified_job.called
-            called_with = data_to_internal(runtime_data)
-            JobTemplate.create_unified_job.assert_called_with(**called_with)
+    mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation')
+    response = post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), runtime_data, admin_user, expect=201)
+    assert JobTemplate.create_unified_job.called
+    called_with = data_to_internal(runtime_data)
+    JobTemplate.create_unified_job.assert_called_with(**called_with)
 
     job_id = response.data['job']
     assert job_id == 968
@@ -187,13 +182,28 @@ def test_job_accept_empty_tags(job_template_prompts, post, admin_user, mocker):
 
     mock_job = mocker.MagicMock(spec=Job, id=968)
 
-    with mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job):
-        with mocker.patch('awx.api.serializers.JobSerializer.to_representation'):
-            post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), {'job_tags': '', 'skip_tags': ''}, admin_user, expect=201)
-            assert JobTemplate.create_unified_job.called
-            assert JobTemplate.create_unified_job.call_args == ({'job_tags': '', 'skip_tags': ''},)
+    mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation')
+    post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), {'job_tags': '', 'skip_tags': ''}, admin_user, expect=201)
+    assert JobTemplate.create_unified_job.called
+    assert JobTemplate.create_unified_job.call_args == ({'job_tags': '', 'skip_tags': ''},)
 
     mock_job.signal_start.assert_called_once()
+
+
+@pytest.mark.django_db
+@pytest.mark.job_runtime_vars
+def test_job_accept_long_skip_tags(job_template_prompts, post, admin_user, mocker):
+    job_template = job_template_prompts(True)
+    long_skip_tags = ','.join(f'tag{i}' for i in range(500))
+    assert len(long_skip_tags) > 1024
+
+    mock_job = mocker.MagicMock(spec=Job, id=968)
+
+    mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation')
+    post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), {'skip_tags': long_skip_tags}, admin_user, expect=201)
+    JobTemplate.create_unified_job.assert_called_once_with(skip_tags=long_skip_tags)
 
 
 @pytest.mark.django_db
@@ -203,14 +213,14 @@ def test_slice_timeout_forks_need_int(job_template_prompts, post, admin_user, mo
 
     mock_job = mocker.MagicMock(spec=Job, id=968)
 
-    with mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job):
-        with mocker.patch('awx.api.serializers.JobSerializer.to_representation'):
-            response = post(
-                reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), {'timeout': '', 'job_slice_count': '', 'forks': ''}, admin_user, expect=400
-            )
-            assert 'forks' in response.data and response.data['forks'][0] == 'A valid integer is required.'
-            assert 'job_slice_count' in response.data and response.data['job_slice_count'][0] == 'A valid integer is required.'
-            assert 'timeout' in response.data and response.data['timeout'][0] == 'A valid integer is required.'
+    mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation')
+    response = post(
+        reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), {'timeout': '', 'job_slice_count': '', 'forks': ''}, admin_user, expect=400
+    )
+    assert 'forks' in response.data and response.data['forks'][0] == 'A valid integer is required.'
+    assert 'job_slice_count' in response.data and response.data['job_slice_count'][0] == 'A valid integer is required.'
+    assert 'timeout' in response.data and response.data['timeout'][0] == 'A valid integer is required.'
 
 
 @pytest.mark.django_db
@@ -244,12 +254,12 @@ def test_job_accept_prompted_vars_null(runtime_data, job_template_prompts_null, 
 
     mock_job = mocker.MagicMock(spec=Job, id=968, **runtime_data)
 
-    with mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job):
-        with mocker.patch('awx.api.serializers.JobSerializer.to_representation'):
-            response = post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), runtime_data, rando, expect=201)
-            assert JobTemplate.create_unified_job.called
-            expected_call = data_to_internal(runtime_data)
-            assert JobTemplate.create_unified_job.call_args == (expected_call,)
+    mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation')
+    response = post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), runtime_data, rando, expect=201)
+    assert JobTemplate.create_unified_job.called
+    expected_call = data_to_internal(runtime_data)
+    assert JobTemplate.create_unified_job.call_args == (expected_call,)
 
     job_id = response.data['job']
     assert job_id == 968
@@ -268,9 +278,9 @@ def test_job_reject_invalid_prompted_vars(runtime_data, job_template_prompts, po
         expect=400,
     )
 
-    assert response.data['job_type'] == [u'"foobicate" is not a valid choice.']
-    assert response.data['inventory'] == [u'Invalid pk "87865" - object does not exist.']
-    assert response.data['credentials'] == [u'Invalid pk "48474" - object does not exist.']
+    assert response.data['job_type'] == ['"foobicate" is not a valid choice.']
+    assert response.data['inventory'] == ['Invalid pk "87865" - object does not exist.']
+    assert response.data['credentials'] == ['Invalid pk "48474" - object does not exist.']
 
 
 @pytest.mark.django_db
@@ -304,7 +314,7 @@ def test_job_launch_fails_without_inventory_access(job_template_prompts, runtime
     # Assure that giving an inventory without access to the inventory blocks the launch
     response = post(reverse('api:job_template_launch', kwargs={'pk': job_template.pk}), dict(inventory=runtime_data['inventory']), rando, expect=403)
 
-    assert response.data['detail'] == u'You do not have permission to perform this action.'
+    assert response.data['detail'] == 'You do not have permission to perform this action.'
 
 
 @pytest.mark.django_db
@@ -530,15 +540,15 @@ def test_job_launch_fails_with_missing_multivault_password(machine_credential, v
     assert {
         'credential_type': vault_cred_first.credential_type_id,
         'passwords_needed': ['vault_password.abc'],
-        'vault_id': u'abc',
-        'name': u'Vault #1',
+        'vault_id': 'abc',
+        'name': 'Vault #1',
         'id': vault_cred_first.id,
     } in resp.data['defaults']['credentials']
     assert {
         'credential_type': vault_cred_second.credential_type_id,
         'passwords_needed': ['vault_password.xyz'],
-        'vault_id': u'xyz',
-        'name': u'Vault #2',
+        'vault_id': 'xyz',
+        'name': 'Vault #2',
         'id': vault_cred_second.id,
     } in resp.data['defaults']['credentials']
 
@@ -641,18 +651,18 @@ def test_job_launch_unprompted_vars_with_survey(mocker, survey_spec_factory, job
     job_template.survey_spec = survey_spec_factory('survey_var')
     job_template.save()
 
-    with mocker.patch('awx.main.access.BaseAccess.check_license'):
-        mock_job = mocker.MagicMock(spec=Job, id=968, extra_vars={"job_launch_var": 3, "survey_var": 4})
-        with mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job):
-            with mocker.patch('awx.api.serializers.JobSerializer.to_representation', return_value={}):
-                response = post(
-                    reverse('api:job_template_launch', kwargs={'pk': job_template.pk}),
-                    dict(extra_vars={"job_launch_var": 3, "survey_var": 4}),
-                    admin_user,
-                    expect=201,
-                )
-                assert JobTemplate.create_unified_job.called
-                assert JobTemplate.create_unified_job.call_args == ({'extra_vars': {'survey_var': 4}},)
+    mocker.patch('awx.main.access.BaseAccess.check_license')
+    mock_job = mocker.MagicMock(spec=Job, id=968, extra_vars={"job_launch_var": 3, "survey_var": 4})
+    mocker.patch.object(JobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation', return_value={})
+    response = post(
+        reverse('api:job_template_launch', kwargs={'pk': job_template.pk}),
+        dict(extra_vars={"job_launch_var": 3, "survey_var": 4}),
+        admin_user,
+        expect=201,
+    )
+    assert JobTemplate.create_unified_job.called
+    assert JobTemplate.create_unified_job.call_args == ({'extra_vars': {'survey_var': 4}},)
 
     job_id = response.data['job']
     assert job_id == 968
@@ -670,22 +680,22 @@ def test_callback_accept_prompted_extra_var(mocker, survey_spec_factory, job_tem
     job_template.survey_spec = survey_spec_factory('survey_var')
     job_template.save()
 
-    with mocker.patch('awx.main.access.BaseAccess.check_license'):
-        mock_job = mocker.MagicMock(spec=Job, id=968, extra_vars={"job_launch_var": 3, "survey_var": 4})
-        with mocker.patch.object(UnifiedJobTemplate, 'create_unified_job', return_value=mock_job):
-            with mocker.patch('awx.api.serializers.JobSerializer.to_representation', return_value={}):
-                with mocker.patch('awx.api.views.JobTemplateCallback.find_matching_hosts', return_value=[host]):
-                    post(
-                        reverse('api:job_template_callback', kwargs={'pk': job_template.pk}),
-                        dict(extra_vars={"job_launch_var": 3, "survey_var": 4}, host_config_key="foo"),
-                        admin_user,
-                        expect=201,
-                        format='json',
-                    )
-                    assert UnifiedJobTemplate.create_unified_job.called
-                    call_args = UnifiedJobTemplate.create_unified_job.call_args[1]
-                    call_args.pop('_eager_fields', None)  # internal purposes
-                    assert call_args == {'extra_vars': {'survey_var': 4, 'job_launch_var': 3}, 'limit': 'single-host'}
+    mocker.patch('awx.main.access.BaseAccess.check_license')
+    mock_job = mocker.MagicMock(spec=Job, id=968, extra_vars={"job_launch_var": 3, "survey_var": 4})
+    mocker.patch.object(UnifiedJobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation', return_value={})
+    mocker.patch('awx.api.views.JobTemplateCallback.find_matching_hosts', return_value=[host])
+    post(
+        reverse('api:job_template_callback', kwargs={'pk': job_template.pk}),
+        dict(extra_vars={"job_launch_var": 3, "survey_var": 4}, host_config_key="foo"),
+        admin_user,
+        expect=201,
+        format='json',
+    )
+    assert UnifiedJobTemplate.create_unified_job.called
+    call_args = UnifiedJobTemplate.create_unified_job.call_args[1]
+    call_args.pop('_eager_fields', None)  # internal purposes
+    assert call_args == {'extra_vars': {'survey_var': 4, 'job_launch_var': 3}, 'limit': 'single-host'}
 
     mock_job.signal_start.assert_called_once()
 
@@ -697,22 +707,22 @@ def test_callback_ignore_unprompted_extra_var(mocker, survey_spec_factory, job_t
     job_template.host_config_key = "foo"
     job_template.save()
 
-    with mocker.patch('awx.main.access.BaseAccess.check_license'):
-        mock_job = mocker.MagicMock(spec=Job, id=968, extra_vars={"job_launch_var": 3, "survey_var": 4})
-        with mocker.patch.object(UnifiedJobTemplate, 'create_unified_job', return_value=mock_job):
-            with mocker.patch('awx.api.serializers.JobSerializer.to_representation', return_value={}):
-                with mocker.patch('awx.api.views.JobTemplateCallback.find_matching_hosts', return_value=[host]):
-                    post(
-                        reverse('api:job_template_callback', kwargs={'pk': job_template.pk}),
-                        dict(extra_vars={"job_launch_var": 3, "survey_var": 4}, host_config_key="foo"),
-                        admin_user,
-                        expect=201,
-                        format='json',
-                    )
-                    assert UnifiedJobTemplate.create_unified_job.called
-                    call_args = UnifiedJobTemplate.create_unified_job.call_args[1]
-                    call_args.pop('_eager_fields', None)  # internal purposes
-                    assert call_args == {'limit': 'single-host'}
+    mocker.patch('awx.main.access.BaseAccess.check_license')
+    mock_job = mocker.MagicMock(spec=Job, id=968, extra_vars={"job_launch_var": 3, "survey_var": 4})
+    mocker.patch.object(UnifiedJobTemplate, 'create_unified_job', return_value=mock_job)
+    mocker.patch('awx.api.serializers.JobSerializer.to_representation', return_value={})
+    mocker.patch('awx.api.views.JobTemplateCallback.find_matching_hosts', return_value=[host])
+    post(
+        reverse('api:job_template_callback', kwargs={'pk': job_template.pk}),
+        dict(extra_vars={"job_launch_var": 3, "survey_var": 4}, host_config_key="foo"),
+        admin_user,
+        expect=201,
+        format='json',
+    )
+    assert UnifiedJobTemplate.create_unified_job.called
+    call_args = UnifiedJobTemplate.create_unified_job.call_args[1]
+    call_args.pop('_eager_fields', None)  # internal purposes
+    assert call_args == {'limit': 'single-host'}
 
     mock_job.signal_start.assert_called_once()
 
@@ -725,9 +735,9 @@ def test_callback_find_matching_hosts(mocker, get, job_template_prompts, admin_u
     job_template.save()
     host_with_alias = Host(name='localhost', inventory=job_template.inventory)
     host_with_alias.save()
-    with mocker.patch('awx.main.access.BaseAccess.check_license'):
-        r = get(reverse('api:job_template_callback', kwargs={'pk': job_template.pk}), user=admin_user, expect=200)
-        assert tuple(r.data['matching_hosts']) == ('localhost',)
+    mocker.patch('awx.main.access.BaseAccess.check_license')
+    r = get(reverse('api:job_template_callback', kwargs={'pk': job_template.pk}), user=admin_user, expect=200)
+    assert tuple(r.data['matching_hosts']) == ('localhost',)
 
 
 @pytest.mark.django_db
@@ -738,6 +748,6 @@ def test_callback_extra_var_takes_priority_over_host_name(mocker, get, job_templ
     job_template.save()
     host_with_alias = Host(name='localhost', variables={'ansible_host': 'foobar'}, inventory=job_template.inventory)
     host_with_alias.save()
-    with mocker.patch('awx.main.access.BaseAccess.check_license'):
-        r = get(reverse('api:job_template_callback', kwargs={'pk': job_template.pk}), user=admin_user, expect=200)
-        assert not r.data['matching_hosts']
+    mocker.patch('awx.main.access.BaseAccess.check_license')
+    r = get(reverse('api:job_template_callback', kwargs={'pk': job_template.pk}), user=admin_user, expect=200)
+    assert not r.data['matching_hosts']

@@ -107,17 +107,17 @@ DOCUMENTATION = """
 """
 
 EXAMPLES = """
-    - name: Create a ruleset for everyday except Sundays
-      set_fact:
-        complex_rule: "{{ query(awx.awx.schedule_rruleset, '2022-04-30 10:30:45', rules=rrules, timezone='UTC' ) }}"
-      vars:
-        rrules:
-          - frequency: 'day'
-            interval: 1
-          - frequency: 'day'
-            interval: 1
-            byweekday: 'sunday'
-            include: False
+- name: Create a ruleset for everyday except Sundays
+  set_fact:
+    complex_rule: "{{ lookup(awx.awx.schedule_rruleset, '2022-04-30 10:30:45', rules=rrules, timezone='UTC' ) }}"
+  vars:
+    rrules:
+      - frequency: 'day'
+        interval: 1
+      - frequency: 'day'
+        interval: 1
+        byweekday: 'sunday'
+        include: false
 """
 
 RETURN = """
@@ -196,7 +196,7 @@ class LookupModule(LookupBase):
         if isinstance(rule[field_name], int):
             rule[field_name] = [rule[field_name]]
         # If its not a list, we need to split it into a list
-        if isinstance(rule[field_name], list):
+        if not isinstance(rule[field_name], list):
             rule[field_name] = rule[field_name].split(',')
         for value in rule[field_name]:
             # If they have a list of strs we want to strip the str incase its space delineated
@@ -210,10 +210,11 @@ class LookupModule(LookupBase):
 
     def process_list(self, field_name, rule, valid_list, rule_number):
         return_values = []
-        if isinstance(rule[field_name], list):
+        # If its not a list, we need to split it into a list
+        if not isinstance(rule[field_name], list):
             rule[field_name] = rule[field_name].split(',')
         for value in rule[field_name]:
-            value = value.strip()
+            value = value.strip().lower()
             if value not in valid_list:
                 raise AnsibleError('In rule {0} {1} must only contain values in {2}'.format(rule_number, field_name, ', '.join(valid_list.keys())))
             return_values.append(valid_list[value])
@@ -351,4 +352,4 @@ class LookupModule(LookupBase):
             raise_from(AnsibleError("Failed to parse generated rule set via rruleset {0}".format(e)), e)
 
         # return self.get_rrule(frequency, kwargs)
-        return rruleset_str
+        return [rruleset_str]

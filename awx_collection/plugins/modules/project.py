@@ -65,7 +65,7 @@ options:
       type: str
     credential:
       description:
-        - Name of the credential to use with this SCM resource.
+        - Name, ID, or named URL of the credential to use with this SCM resource.
       type: str
       aliases:
         - scm_credential
@@ -83,7 +83,7 @@ options:
       type: bool
     scm_update_on_launch:
       description:
-        - Before an update to the local repository before launching a job with this project.
+        - Perform an update to the local repository before launching a job with this project.
       type: bool
     scm_update_cache_timeout:
       description:
@@ -106,7 +106,7 @@ options:
         - job_timeout
     default_environment:
       description:
-        - Default Execution Environment to use for jobs relating to the project.
+        - Default Execution Environment name, ID, or named URL to use for jobs relating to the project.
       type: str
     custom_virtualenv:
       description:
@@ -116,13 +116,13 @@ options:
       type: str
     organization:
       description:
-        - Name of organization for project.
+        - Name, ID, or named URL of organization for the project.
       type: str
     state:
       description:
         - Desired state of the resource.
       default: "present"
-      choices: ["present", "absent"]
+      choices: ["present", "absent", "exists"]
       type: str
     wait:
       description:
@@ -162,7 +162,7 @@ options:
       type: float
     signature_validation_credential:
       description:
-        - Name of the credential to use for signature validation.
+        - Name, ID, or named URL of the credential to use for signature validation.
         - If signature validation credential is provided, signature validation will be enabled.
       type: str
 
@@ -184,7 +184,7 @@ EXAMPLES = '''
     name: "Foo"
     description: "Foo bar project"
     organization: "test"
-    scm_update_on_launch: True
+    scm_update_on_launch: true
     scm_update_cache_timeout: 60
     state: present
     controller_config_file: "~/tower_cli.cfg"
@@ -272,7 +272,7 @@ def main():
         notification_templates_started=dict(type="list", elements='str'),
         notification_templates_success=dict(type="list", elements='str'),
         notification_templates_error=dict(type="list", elements='str'),
-        state=dict(choices=['present', 'absent'], default='present'),
+        state=dict(choices=['present', 'absent', 'exists'], default='present'),
         wait=dict(type='bool', default=True),
         update_project=dict(default=False, type='bool'),
         interval=dict(default=2.0, type='float'),
@@ -284,13 +284,15 @@ def main():
         argument_spec=argument_spec,
     )
 
+    # Alias for manual projects
+    if module.params.get('scm_type') == "manual":
+        module.params['scm_type'] = ''
+
     # Extract our parameters
     name = module.params.get('name')
     new_name = module.params.get("new_name")
     copy_from = module.params.get('copy_from')
     scm_type = module.params.get('scm_type')
-    if scm_type == "manual":
-        scm_type = ""
     local_path = module.params.get('local_path')
     credential = module.params.get('credential')
     scm_update_on_launch = module.params.get('scm_update_on_launch')
@@ -311,7 +313,7 @@ def main():
         lookup_data['organization'] = org_id
 
     # Attempt to look up project based on the provided name and org ID
-    project = module.get_one('projects', name_or_id=name, data=lookup_data)
+    project = module.get_one('projects', name_or_id=name, check_exists=(state == 'exists'), data=lookup_data)
 
     # Attempt to look up credential to copy based on the provided name
     if copy_from:
@@ -387,7 +389,8 @@ def main():
         # this is resolved earlier, so save an API call and don't do it again in the loop above
         project_fields['organization'] = org_id
 
-    if scm_type == '' and local_path is not None:
+    # Respect local_path if scm_type is manual type or not specified
+    if scm_type in ('', None) and local_path is not None:
         project_fields['local_path'] = local_path
 
     if scm_update_cache_timeout not in (0, None) and scm_update_on_launch is not True:

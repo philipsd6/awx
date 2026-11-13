@@ -7,7 +7,12 @@ from django.core.exceptions import ValidationError
 
 from awx.api.versioning import reverse
 
-from awx.main.models import InventorySource, Inventory, ActivityStream
+from awx.main.models import InventorySource, Inventory, ActivityStream, Organization, Host
+from awx.main.utils.inventory_vars import update_group_variables
+
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+from django.utils.timezone import now
 
 
 @pytest.fixture
@@ -15,15 +20,6 @@ def scm_inventory(inventory, project):
     with mock.patch('awx.main.models.unified_jobs.UnifiedJobTemplate.update'):
         inventory.inventory_sources.create(name='foobar', source='scm', source_project=project)
     return inventory
-
-
-@pytest.fixture
-def factory_scm_inventory(inventory, project):
-    def fn(**kwargs):
-        with mock.patch('awx.main.models.unified_jobs.UnifiedJobTemplate.update'):
-            return inventory.inventory_sources.create(source_project=project, overwrite_vars=True, source='scm', **kwargs)
-
-    return fn
 
 
 @pytest.mark.django_db
@@ -73,6 +69,44 @@ def test_inventory_host_name_unique(scm_inventory, post, admin_user):
 
 
 @pytest.mark.django_db
+def test_inventory_host_inline_port(scm_inventory, post, admin_user):
+    with mock.patch('ansible_base.lib.serializers.mixins.get_setting', return_value=True):
+        resp = post(
+            reverse('api:inventory_hosts_list', kwargs={'pk': scm_inventory.id}),
+            {'name': 'web.example.com:2222'},
+            admin_user,
+            expect=201,
+        )
+    assert resp.data['name'] == 'web.example.com'
+    assert '2222' in resp.data['variables']
+
+
+@pytest.mark.django_db
+def test_inventory_host_ipv6_name(scm_inventory, post, admin_user):
+    """HostSerializer demotes name from Tier 1 so IPv6 (multiple colons)
+    is not rejected once enforcement is on (AAP-78694)."""
+    with mock.patch('ansible_base.lib.serializers.mixins.get_setting', return_value=True):
+        resp = post(
+            reverse('api:inventory_hosts_list', kwargs={'pk': scm_inventory.id}),
+            {'name': '2001:db8::1'},
+            admin_user,
+            expect=201,
+        )
+    assert resp.data['name'] == '2001:db8::1'
+
+
+@pytest.mark.django_db
+def test_inventory_host_invalid_inline_port(scm_inventory, post, admin_user):
+    resp = post(
+        reverse('api:inventory_hosts_list', kwargs={'pk': scm_inventory.id}),
+        {'name': 'web.example.com:99999'},
+        admin_user,
+        expect=400,
+    )
+    assert 'Invalid port' in json.dumps(resp.data)
+
+
+@pytest.mark.django_db
 def test_inventory_host_list_ordering(scm_inventory, get, admin_user):
     # create 3 hosts, hit the inventory host list view 3 times and get the order visible there each time and compare
     inv_src = scm_inventory.inventory_sources.first()
@@ -86,6 +120,27 @@ def test_inventory_host_list_ordering(scm_inventory, get, admin_user):
     ).data['results']
     host_list = [host['id'] for host in resp]
     assert host_list == expected_ids
+
+
+@pytest.mark.django_db
+def test_inventory_hosts_attach_uses_bounded_membership_check(inventory, post, admin_user):
+    """attach()'s membership check must filter by the host's own pk and be LIMIT-bounded, not scan every host in the inventory."""
+    _now = now()
+    existing_hosts = [Host(name=f'existing-host-{i}', inventory=inventory, created=_now, modified=_now) for i in range(5)]
+    Host.objects.bulk_create(existing_hosts)
+
+    with CaptureQueriesContext(connection) as ctx:
+        post(reverse('api:inventory_hosts_list', kwargs={'pk': inventory.id}), {'name': 'new-host'}, admin_user, expect=201)
+
+    membership_check_queries = [
+        q['sql']
+        for q in ctx.captured_queries
+        if 'FROM "main_host"' in q['sql'] and '"main_host"."inventory_id" = ' in q['sql'] and '"main_host"."name" = ' not in q['sql']
+    ]
+    assert membership_check_queries, "expected a query checking host membership in the inventory"
+    for sql in membership_check_queries:
+        assert '"main_host"."id" = ' in sql, f"attach() membership check is not filtered by the host's own pk: {sql}"
+        assert 'LIMIT' in sql, f"attach() membership check is not LIMIT-bounded: {sql}"
 
 
 @pytest.mark.django_db
@@ -293,12 +348,12 @@ def test_urlencode_host_filter(post, admin_user, organization):
 def test_host_filter_unicode(post, admin_user, organization):
     post(
         reverse('api:inventory_list'),
-        data={'name': 'smart inventory', 'kind': 'smart', 'organization': organization.pk, 'host_filter': u'ansible_facts__ansible_distribution=レッドハット'},
+        data={'name': 'smart inventory', 'kind': 'smart', 'organization': organization.pk, 'host_filter': 'ansible_facts__ansible_distribution=レッドハット'},
         user=admin_user,
         expect=201,
     )
     si = Inventory.objects.get(name='smart inventory')
-    assert si.host_filter == u'ansible_facts__ansible_distribution=レッドハット'
+    assert si.host_filter == 'ansible_facts__ansible_distribution=レッドハット'
 
 
 @pytest.mark.django_db
@@ -310,7 +365,7 @@ def test_host_filter_invalid_ansible_facts_lookup(post, admin_user, organization
             'name': 'smart inventory',
             'kind': 'smart',
             'organization': organization.pk,
-            'host_filter': u'ansible_facts__ansible_distribution__{}=cent'.format(lookup),
+            'host_filter': 'ansible_facts__ansible_distribution__{}=cent'.format(lookup),
         },
         user=admin_user,
         expect=400,
@@ -425,7 +480,7 @@ def test_inventory_source_vars_prohibition(post, inventory, admin_user):
         mock_settings.INV_ENV_VARIABLE_BLOCKED = ('FOOBAR',)
         r = post(
             reverse('api:inventory_source_list'),
-            {'name': 'new inv src', 'source_vars': '{\"FOOBAR\": \"val\"}', 'inventory': inventory.pk},
+            {'name': 'new inv src', 'source_vars': '{"FOOBAR": "val"}', 'inventory': inventory.pk},
             admin_user,
             expect=400,
         )
@@ -470,6 +525,26 @@ class TestInventorySourceCredential:
         )
         assert 'Cloud-based inventory sources (such as ec2)' in r.data['credential'][0]
         assert 'require credentials for the matching cloud service' in r.data['credential'][0]
+
+    def test_credential_dict_value_returns_400(self, inventory, admin_user, put):
+        """Passing a dict for the credential field should return 400, not 500.
+
+        Reproduces a bug where int() raises TypeError on non-scalar types
+        (dict, list) which was uncaught, resulting in a 500 Internal Server Error.
+        """
+        inv_src = InventorySource.objects.create(name='test-src', inventory=inventory, source='ec2')
+        r = put(
+            url=reverse('api:inventory_source_detail', kwargs={'pk': inv_src.pk}),
+            data={
+                'name': 'test-src',
+                'inventory': inventory.pk,
+                'source': 'ec2',
+                'credential': {'username': 'admin', 'password': 'secret'},
+            },
+            user=admin_user,
+            expect=400,
+        )
+        assert r.status_code == 400
 
     def test_vault_credential_not_allowed(self, project, inventory, vault_credential, admin_user, post):
         """Vault credentials cannot be associated via the deprecated field"""
@@ -528,6 +603,20 @@ class TestInventorySourceCredential:
         assert list(inv_src.credentials.values_list('id', flat=True)) == [os_cred.pk]
         patch(url=inv_src.get_absolute_url(), data={'credential': aws_cred.pk}, expect=200, user=admin_user)
         assert list(inv_src.credentials.values_list('id', flat=True)) == [aws_cred.pk]
+
+    @pytest.mark.skip(reason="Delay until AAP-53978 completed")
+    def test_vmware_cred_create_esxi_source(self, inventory, admin_user, organization, post, get):
+        """Test that a vmware esxi source can be added with a vmware credential"""
+        from awx.main.models.credential import Credential, CredentialType
+
+        vmware = CredentialType.defaults['vmware']()
+        vmware.save()
+        vmware_cred = Credential.objects.create(credential_type=vmware, name="bar", organization=organization)
+        inv_src = InventorySource.objects.create(inventory=inventory, name='foobar', source='vmware_esxi')
+        r = post(url=reverse('api:inventory_source_credentials_list', kwargs={'pk': inv_src.pk}), data={'id': vmware_cred.pk}, expect=204, user=admin_user)
+        g = get(inv_src.get_absolute_url(), admin_user)
+        assert r.status_code == 204
+        assert g.data['credential'] == vmware_cred.pk
 
 
 @pytest.mark.django_db
@@ -594,3 +683,464 @@ class TestControlledBySCM:
             rando,
             expect=403,
         )
+
+
+@pytest.mark.django_db
+class TestConstructedInventory:
+    @pytest.fixture
+    def constructed_inventory(self, organization):
+        return Inventory.objects.create(name='constructed-test-inventory', kind='constructed', organization=organization)
+
+    def test_get_constructed_inventory(self, constructed_inventory, admin_user, get):
+        inv_src = constructed_inventory.inventory_sources.first()
+        inv_src.update_cache_timeout = 53
+        inv_src.save(update_fields=['update_cache_timeout'])
+        r = get(url=reverse('api:constructed_inventory_detail', kwargs={'pk': constructed_inventory.pk}), user=admin_user, expect=200)
+        assert r.data['update_cache_timeout'] == 53
+
+    def test_patch_constructed_inventory(self, constructed_inventory, admin_user, patch):
+        inv_src = constructed_inventory.inventory_sources.first()
+        assert inv_src.update_cache_timeout == 0
+        assert inv_src.limit == ''
+        r = patch(
+            url=reverse('api:constructed_inventory_detail', kwargs={'pk': constructed_inventory.pk}),
+            data=dict(update_cache_timeout=54, limit='foobar'),
+            user=admin_user,
+            expect=200,
+        )
+        assert r.data['update_cache_timeout'] == 54
+        inv_src = constructed_inventory.inventory_sources.first()
+        assert inv_src.update_cache_timeout == 54
+        assert inv_src.limit == 'foobar'
+
+    def test_patch_constructed_inventory_generated_source_limits_editable_fields(self, constructed_inventory, admin_user, project, patch):
+        inv_src = constructed_inventory.inventory_sources.first()
+        r = patch(
+            url=inv_src.get_absolute_url(),
+            data={
+                'source': 'scm',
+                'source_project': project.pk,
+                'source_path': '',
+                'source_vars': 'plugin: a.b.c',
+            },
+            expect=400,
+            user=admin_user,
+        )
+        assert str(r.data['error'][0]) == "Cannot change field 'source' on a constructed inventory source."
+
+        # Make sure it didn't get updated before we got the error
+        inv_src_after_err = constructed_inventory.inventory_sources.first()
+        assert inv_src.id == inv_src_after_err.id
+        assert inv_src.source == inv_src_after_err.source
+        assert inv_src.source_project == inv_src_after_err.source_project
+        assert inv_src.source_path == inv_src_after_err.source_path
+        assert inv_src.source_vars == inv_src_after_err.source_vars
+
+    def test_patch_constructed_inventory_generated_source_allows_source_vars_edit(self, constructed_inventory, admin_user, patch):
+        inv_src = constructed_inventory.inventory_sources.first()
+        patch(
+            url=inv_src.get_absolute_url(),
+            data={
+                'source_vars': 'plugin: a.b.c',
+            },
+            expect=200,
+            user=admin_user,
+        )
+
+        inv_src_after_patch = constructed_inventory.inventory_sources.first()
+
+        # sanity checks
+        assert inv_src.id == inv_src_after_patch.id
+        assert inv_src.source == 'constructed'
+        assert inv_src_after_patch.source == 'constructed'
+        assert inv_src.source_vars == ''
+
+        assert inv_src_after_patch.source_vars == 'plugin: a.b.c'
+
+    def test_create_constructed_inventory(self, constructed_inventory, admin_user, post, organization):
+        r = post(
+            url=reverse('api:constructed_inventory_list'),
+            data=dict(name='constructed-inventory-just-created', kind='constructed', organization=organization.id, update_cache_timeout=55, limit='foobar'),
+            user=admin_user,
+            expect=201,
+        )
+        pk = r.data['id']
+        constructed_inventory = Inventory.objects.get(pk=pk)
+        inv_src = constructed_inventory.inventory_sources.first()
+        assert inv_src.update_cache_timeout == 55
+        assert inv_src.limit == 'foobar'
+
+    def test_get_absolute_url_for_constructed_inventory(self, constructed_inventory, admin_user, get):
+        """
+        If we are using the normal inventory API endpoint to look at a
+        constructed inventory, then we should get a normal inventory API route
+        back. If we are accessing it via the special constructed inventory
+        endpoint, then we should get that back.
+        """
+
+        url_const = reverse('api:constructed_inventory_detail', kwargs={'pk': constructed_inventory.pk})
+        url_inv = reverse('api:inventory_detail', kwargs={'pk': constructed_inventory.pk})
+
+        const_r = get(url=url_const, user=admin_user, expect=200)
+        inv_r = get(url=url_inv, user=admin_user, expect=200)
+        assert const_r.data['url'] == url_const
+        assert inv_r.data['url'] == url_inv
+        assert inv_r.data['url'] != const_r.data['url']
+        assert inv_r.data['related']['constructed_url'] == url_const
+        assert const_r.data['related']['constructed_url'] == url_const
+
+
+@pytest.mark.django_db
+class TestInventoryAllVariables:
+    @staticmethod
+    def simulate_update_from_source(inv_src, variables_dict, overwrite_vars=True):
+        """
+        Update `inventory` with variables `variables_dict` from source
+        `inv_src`.
+        """
+        # Perform an update from source the same way it is done in
+        # `inventory_import.Command._update_inventory`.
+        new_vars = update_group_variables(
+            group_id=None,  # `None` denotes the 'all' group (which doesn't have a pk).
+            newvars=variables_dict,
+            dbvars=inv_src.inventory.variables_dict,
+            invsrc_id=inv_src.id,
+            inventory_id=inv_src.inventory.id,
+            overwrite_vars=overwrite_vars,
+        )
+        inv_src.inventory.variables = json.dumps(new_vars)
+        inv_src.inventory.save(update_fields=["variables"])
+        return new_vars
+
+    def update_and_verify(self, inv_src, new_vars, expect=None, overwrite_vars=True, teststep=None):
+        """
+        Helper: Update from source and verify the new inventory variables.
+
+        :param inv_src: An inventory source object with its inventory property
+            set to the inventory fixture of the called.
+        :param dict new_vars: The variables of the inventory source `inv_src`.
+        :param dict expect: (optional) The expected variables state of the
+            inventory after the update. If not set or None, expect `new_vars`.
+        :param bool overwrite_vars: The status of the inventory source option
+            'overwrite variables'. Default is `True`.
+        :raise AssertionError: If the inventory does not contain the expected
+            variables after the update.
+        """
+        self.simulate_update_from_source(inv_src, new_vars, overwrite_vars=overwrite_vars)
+        if teststep is not None:
+            assert inv_src.inventory.variables_dict == (expect if expect is not None else new_vars), f"Test step {teststep}"
+        else:
+            assert inv_src.inventory.variables_dict == (expect if expect is not None else new_vars)
+
+    def test_set_variables_through_inventory_details_update(self, inventory, patch, admin_user):
+        """
+        Set an inventory variable by changing the inventory details, simulating
+        a user edit.
+        """
+        # a: x
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'a: x'}, user=admin_user, expect=200)
+        inventory.refresh_from_db()
+        assert inventory.variables_dict == {"a": "x"}
+
+    def test_variables_set_by_user_persist_update_from_src(self, inventory, inventory_source, patch, admin_user):
+        """
+        Verify the special behavior that a variable which originates from a user
+        edit (instead of a source update), is not removed from the inventory
+        when a source update with overwrite_vars=True does not contain that
+        variable. This behavior is considered special because a variable which
+        originates from a source would actually be deleted.
+
+        In addition, verify that an existing variable which was set by a user
+        edit can be overwritten by a source update.
+        """
+        # Set two variables via user edit.
+        patch(
+            url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}),
+            data={'variables': '{"a": "a_from_user", "b": "b_from_user"}'},
+            user=admin_user,
+            expect=200,
+        )
+        inventory.refresh_from_db()
+        assert inventory.variables_dict == {'a': 'a_from_user', 'b': 'b_from_user'}
+        # Update from a source which contains only one of the two variables from
+        # the previous update.
+        self.simulate_update_from_source(inventory_source, {'a': 'a_from_source'})
+        # Verify inventory variables.
+        assert inventory.variables_dict == {'a': 'a_from_source', 'b': 'b_from_user'}
+
+    def test_variables_set_through_src_get_removed_on_update_from_same_src(self, inventory, inventory_source, patch, admin_user):
+        """
+        Verify that a variable which originates from a source update, is removed
+        from the inventory when a source update with overwrite_vars=True does
+        not contain that variable.
+
+        In addition, verify that an existing variable which was set by a user
+        edit can be overwritten by a source update.
+        """
+        # Set two variables via update from source.
+        self.simulate_update_from_source(inventory_source, {'a': 'a_from_source', 'b': 'b_from_source'})
+        # Verify inventory variables.
+        assert inventory.variables_dict == {'a': 'a_from_source', 'b': 'b_from_source'}
+        # Update from the same source which now contains only one of the two
+        # variables from the previous update.
+        self.simulate_update_from_source(inventory_source, {'b': 'b_from_source'})
+        # Verify the variable has been deleted from the inventory.
+        assert inventory.variables_dict == {'b': 'b_from_source'}
+
+    def test_overwrite_variables_through_inventory_details_update(self, inventory, patch, admin_user):
+        """
+        Set and update the inventory variables multiple times by changing the
+        inventory details via api, simulating user edits.
+
+        Any variables update by means of an inventory details update shall
+        overwright all existing inventory variables.
+        """
+        # a: x
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'a: x'}, user=admin_user, expect=200)
+        inventory.refresh_from_db()
+        assert inventory.variables_dict == {"a": "x"}
+        # a: x2
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'a: x2'}, user=admin_user, expect=200)
+        inventory.refresh_from_db()
+        assert inventory.variables_dict == {"a": "x2"}
+        # b: y
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'b: y'}, user=admin_user, expect=200)
+        inventory.refresh_from_db()
+        assert inventory.variables_dict == {"b": "y"}
+
+    def test_inventory_group_variables_internal_data(self, inventory, patch, admin_user):
+        """
+        Basic verification of how variable updates are stored internally.
+
+        .. Warning::
+
+            This test verifies a specific implementation of the inventory
+            variables update business logic. It may deliver false negatives if
+            the implementation changes.
+        """
+        # x: a
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'a: x'}, user=admin_user, expect=200)
+        igv = inventory.inventory_group_variables.first()
+        assert igv.variables == {'a': [[-1, 'x']]}
+        # b: y
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'b: y'}, user=admin_user, expect=200)
+        igv = inventory.inventory_group_variables.first()
+        assert igv.variables == {'b': [[-1, 'y']]}
+
+    def test_update_then_user_change(self, inventory, patch, admin_user, inventory_source):
+        """
+        1. Update inventory vars by means of an inventory source update.
+        2. Update inventory vars by editing the inventory details (aka a 'user
+           update'), thereby changing variables values and deleting variables
+           from the inventory.
+
+        .. Warning::
+
+            This test partly relies on a specific implementation of the
+            inventory variables update business logic. It may deliver false
+            negatives if the implementation changes.
+        """
+        assert inventory_source.inventory_id == inventory.pk  # sanity
+        # ---- Test step 1: Set variables by updating from an inventory source.
+        self.simulate_update_from_source(inventory_source, {'foo': 'foo_from_source', 'bar': 'bar_from_source'})
+        # Verify inventory variables.
+        assert inventory.variables_dict == {'foo': 'foo_from_source', 'bar': 'bar_from_source'}
+        # Verify internal storage of variables data. Note that this is
+        # implementation specific
+        assert inventory.inventory_group_variables.count() == 1
+        igv = inventory.inventory_group_variables.first()
+        assert igv.variables == {'foo': [[inventory_source.id, 'foo_from_source']], 'bar': [[inventory_source.id, 'bar_from_source']]}
+        # ---- Test step 2: Change the variables by editing the inventory details.
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'foo: foo_from_user'}, user=admin_user, expect=200)
+        inventory.refresh_from_db()
+        # Verify that variable `foo` contains the new value, and that variable
+        # `bar` has been deleted from the inventory.
+        assert inventory.variables_dict == {"foo": "foo_from_user"}
+        # Verify internal storage of variables data. Note that this is
+        # implementation specific
+        inventory.inventory_group_variables.count() == 1
+        igv = inventory.inventory_group_variables.first()
+        assert igv.variables == {'foo': [[-1, 'foo_from_user']]}
+
+    def test_monotonic_deletions(self, inventory, patch, admin_user):
+        """
+        Verify the variables history logic for monotonic deletions.
+
+        Monotonic in this context means that the variables are deleted in the
+        reverse order of their creation.
+
+        1. Set inventory variable x: 0, expect INV={x: 0}
+
+        (The following steps use overwrite_variables=False)
+
+        2. Update from source A={x: 1}, expect INV={x: 1}
+        3. Update from source B={x: 2}, expect INV={x: 2}
+        4. Update from source B={}, expect INV={x: 1}
+        5. Update from source A={}, expect INV={x: 0}
+        """
+        inv_src_a = InventorySource.objects.create(name="inv-src-A", inventory=inventory, source="ec2")
+        inv_src_b = InventorySource.objects.create(name="inv-src-B", inventory=inventory, source="ec2")
+        # Test step 1:
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'x: 0'}, user=admin_user, expect=200)
+        inventory.refresh_from_db()
+        assert inventory.variables_dict == {"x": 0}
+        # Test step 2: Source A overwrites value of var x
+        self.update_and_verify(inv_src_a, {"x": 1}, teststep=2)
+        # Test step 3: Source A overwrites value of var x
+        self.update_and_verify(inv_src_b, {"x": 2}, teststep=3)
+        # Test step 4: Value of var x from source A reappears
+        self.update_and_verify(inv_src_b, {}, expect={"x": 1}, teststep=4)
+        # Test step 5: Value of var x from initial user edit reappears
+        self.update_and_verify(inv_src_a, {}, expect={"x": 0}, teststep=5)
+
+    def test_interleaved_deletions(self, inventory, patch, admin_user, inventory_source):
+        """
+        Verify the variables history logic for interleaved deletions.
+
+        Interleaved in this context means that the variables are deleted in a
+        different order than the sequence of their creation.
+
+        1. Set inventory variable x: 0, expect INV={x: 0}
+        2. Update from source A={x: 1}, expect INV={x: 1}
+        3. Update from source B={x: 2}, expect INV={x: 2}
+        4. Update from source C={x: 3}, expect INV={x: 3}
+        5. Update from source B={}, expect INV={x: 3}
+        6. Update from source C={}, expect INV={x: 1}
+        """
+        inv_src_a = InventorySource.objects.create(name="inv-src-A", inventory=inventory, source="ec2")
+        inv_src_b = InventorySource.objects.create(name="inv-src-B", inventory=inventory, source="ec2")
+        inv_src_c = InventorySource.objects.create(name="inv-src-C", inventory=inventory, source="ec2")
+        # Test step 1. Set inventory variable x: 0
+        patch(url=reverse('api:inventory_detail', kwargs={'pk': inventory.pk}), data={'variables': 'x: 0'}, user=admin_user, expect=200)
+        inventory.refresh_from_db()
+        assert inventory.variables_dict == {"x": 0}
+        # Test step 2: Source A overwrites value of var x
+        self.update_and_verify(inv_src_a, {"x": 1}, teststep=2)
+        # Test step 3: Source B overwrites value of var x
+        self.update_and_verify(inv_src_b, {"x": 2}, teststep=3)
+        # Test step 4: Source C overwrites value of var x
+        self.update_and_verify(inv_src_c, {"x": 3}, teststep=4)
+        # Test step 5: Value of var x from source C remains unchanged
+        self.update_and_verify(inv_src_b, {}, expect={"x": 3}, teststep=5)
+        # Test step 6: Value of var x from source A reappears, because the
+        # latest update from source B did not contain var x.
+        self.update_and_verify(inv_src_c, {}, expect={"x": 1}, teststep=6)
+
+
+@pytest.mark.django_db
+def test_inventory_names_unique_per_organization(post, admin_user):
+    """Validate that two inventories can have the same name if they belong to different organizations."""
+    org1 = Organization.objects.create(name='org-inv-1')
+    org2 = Organization.objects.create(name='org-inv-2')
+    inv_name = 'SharedInventoryName'
+
+    # Create inventory with same name in org1
+    resp1 = post(
+        reverse('api:inventory_list'),
+        {'name': inv_name, 'organization': org1.id},
+        admin_user,
+        expect=201,
+    )
+    inv1_id = resp1.data['id']
+
+    # Create inventory with same name in org2 - should succeed
+    resp2 = post(
+        reverse('api:inventory_list'),
+        {'name': inv_name, 'organization': org2.id},
+        admin_user,
+        expect=201,
+    )
+    inv2_id = resp2.data['id']
+
+    assert inv1_id != inv2_id
+    inv1 = Inventory.objects.get(id=inv1_id)
+    inv2 = Inventory.objects.get(id=inv2_id)
+    assert inv1.name == inv2.name == inv_name
+    assert inv1.organization.id == org1.id
+    assert inv2.organization.id == org2.id
+
+    # Attempt to create another inventory with same name in org1 - should fail
+    resp3 = post(
+        reverse('api:inventory_list'),
+        {'name': inv_name, 'organization': org1.id},
+        admin_user,
+        expect=400,
+    )
+    assert 'Inventory with this Name and Organization already exists' in json.dumps(resp3.data)
+
+
+@pytest.mark.django_db
+class TestSourcePathTraversal:
+    """Serializer-level path traversal prevention on InventorySource.source_path (AAP-78700)."""
+
+    def _create_payload(self, inventory, project, source_path, name='scm-src'):
+        return {
+            'inventory': inventory.pk,
+            'name': name,
+            'source': 'scm',
+            'source_project': project.pk,
+            'source_path': source_path,
+            'source_vars': 'plugin: a.b.c',
+        }
+
+    @pytest.mark.parametrize(
+        'source_path',
+        [
+            '../etc/passwd',
+            'inventories/../secrets',
+            '..\\windows\\path',
+        ],
+    )
+    def test_create_rejects_traversal(self, post, inventory, project, admin_user, source_path):
+        response = post(
+            reverse('api:inventory_source_list'),
+            self._create_payload(inventory, project, source_path),
+            admin_user,
+            expect=400,
+        )
+        assert 'source_path' in response.data
+
+    def test_create_accepts_valid_path(self, post, inventory, project, admin_user):
+        response = post(
+            reverse('api:inventory_source_list'),
+            self._create_payload(inventory, project, 'playbooks/main.yml'),
+            admin_user,
+            expect=201,
+        )
+        assert response.data['source_path'] == 'playbooks/main.yml'
+
+    def test_update_rejects_changed_traversal_path(self, patch, inventory, project, admin_user):
+        with mock.patch('awx.main.models.unified_jobs.UnifiedJobTemplate.update'):
+            inv_src = InventorySource.objects.create(
+                inventory=inventory,
+                name='scm-src',
+                source='scm',
+                source_project=project,
+                source_path='playbooks/main.yml',
+            )
+        response = patch(
+            inv_src.get_absolute_url(),
+            {'source_path': '../etc/passwd'},
+            admin_user,
+            expect=400,
+        )
+        assert 'source_path' in response.data
+
+    def test_update_grandfathers_unchanged_traversal_path(self, patch, inventory, project, admin_user):
+        legacy_path = '../legacy/hosts'
+        with mock.patch('awx.main.models.unified_jobs.UnifiedJobTemplate.update'):
+            inv_src = InventorySource.objects.create(
+                inventory=inventory,
+                name='legacy-src',
+                source='scm',
+                source_project=project,
+                source_path=legacy_path,
+            )
+        response = patch(
+            inv_src.get_absolute_url(),
+            {'source_path': legacy_path, 'name': 'legacy-src-renamed'},
+            admin_user,
+            expect=200,
+        )
+        assert response.data['source_path'] == legacy_path
+        assert response.data['name'] == 'legacy-src-renamed'

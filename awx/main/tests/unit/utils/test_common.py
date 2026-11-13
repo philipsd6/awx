@@ -12,6 +12,8 @@ from unittest import mock
 
 from rest_framework.exceptions import ParseError
 
+from ansible_base.lib.utils.models import get_type_for_model
+
 from awx.main.utils import common
 from awx.api.validators import HostnameRegexValidator
 
@@ -106,7 +108,7 @@ TEST_MODELS = [
 # Cases relied on for scheduler dependent jobs list
 @pytest.mark.parametrize('model,name', TEST_MODELS)
 def test_get_type_for_model(model, name):
-    assert common.get_type_for_model(model) == name
+    assert get_type_for_model(model) == name
 
 
 def test_get_model_for_invalid_type():
@@ -117,6 +119,10 @@ def test_get_model_for_invalid_type():
 @pytest.mark.parametrize("model_type,model_class", [(name, cls) for cls, name in TEST_MODELS])
 def test_get_model_for_valid_type(model_type, model_class):
     assert common.get_model_for_type(model_type) == model_class
+
+
+def test_is_testing():
+    assert common.is_testing() is True
 
 
 @pytest.mark.parametrize("model_type,model_class", [(name, cls) for cls, name in TEST_MODELS])
@@ -157,13 +163,13 @@ def memoized_function(mocker, mock_cache):
 
 def test_memoize_track_function(memoized_function, mock_cache):
     assert memoized_function('scott', 'scotterson') == 'scotterson'
-    assert mock_cache.get('myfunction') == {u'scott-scotterson': 'scotterson'}
+    assert mock_cache.get('myfunction') == {'scott-scotterson': 'scotterson'}
     assert memoized_function('scott', 'scotterson') == 'scotterson'
 
     assert memoized_function.calls['scott'] == 1
 
     assert memoized_function('john', 'smith') == 'smith'
-    assert mock_cache.get('myfunction') == {u'scott-scotterson': 'scotterson', u'john-smith': 'smith'}
+    assert mock_cache.get('myfunction') == {'scott-scotterson': 'scotterson', 'john-smith': 'smith'}
     assert memoized_function('john', 'smith') == 'smith'
 
     assert memoized_function.calls['john'] == 1
@@ -174,7 +180,7 @@ def test_memoize_delete(memoized_function, mock_cache):
     assert memoized_function('john', 'smith') == 'smith'
     assert memoized_function.calls['john'] == 1
 
-    assert mock_cache.get('myfunction') == {u'john-smith': 'smith'}
+    assert mock_cache.get('myfunction') == {'john-smith': 'smith'}
 
     with mock.patch('awx.main.utils.common.memoize_delete', side_effect=mock_cache.delete):
         common.memoize_delete('myfunction')
@@ -234,7 +240,15 @@ def test_extract_ansible_vars():
         ('git', 'https://example.com/bar.git', 'user', 'pw', True, False, 'https://user:pw@example.com/bar.git'),
         ('git', 'https://example@example.com/bar.git', False, 'something', True, False, 'https://example.com/bar.git'),
         # Special github/bitbucket cases
-        ('git', 'notgit@github.com:ansible/awx.git', True, True, True, False, ValueError('Username must be "git" for SSH access to github.com.')),
+        (
+            'git',
+            'notgit@github.com:ansible/awx.git',
+            True,
+            True,
+            True,
+            False,
+            ValueError('Username must be "git" for SSH access to github.com.'),
+        ),
         (
             'git',
             'notgit@bitbucket.org:does-not-exist/example.git',
@@ -312,22 +326,18 @@ class TestHostnameRegexValidator:
 
     def test_good_call(self, regex_expr, re_flags):
         h = HostnameRegexValidator(regex=regex_expr, flags=re_flags)
-        assert (h("192.168.56.101"), None)
+        assert h("192.168.56.101") is None
 
     def test_bad_call(self, regex_expr, re_flags):
         h = HostnameRegexValidator(regex=regex_expr, flags=re_flags)
-        try:
+        with pytest.raises(ValidationError, match=r"^\['illegal characters detected in hostname=@#\$%\)\$#\(TUFAS_DG. Please verify.'\]$"):
             h("@#$%)$#(TUFAS_DG")
-        except ValidationError as e:
-            assert e.message is not None
 
     def test_good_call_with_inverse(self, regex_expr, re_flags, inverse_match=True):
         h = HostnameRegexValidator(regex=regex_expr, flags=re_flags, inverse_match=inverse_match)
-        try:
+        with pytest.raises(ValidationError, match=r"^\['Enter a valid value.'\]$"):
             h("1.2.3.4")
-        except ValidationError as e:
-            assert e.message is not None
 
     def test_bad_call_with_inverse(self, regex_expr, re_flags, inverse_match=True):
         h = HostnameRegexValidator(regex=regex_expr, flags=re_flags, inverse_match=inverse_match)
-        assert (h("@#$%)$#(TUFAS_DG"), None)
+        assert h("@#$%)$#(TUFAS_DG") is None

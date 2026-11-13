@@ -1,10 +1,15 @@
 import json
+import os.path
 import time
 import logging
 from collections import deque
+from typing import Tuple, Optional
+
+from awx.main.models.event_query import EventQuery
 
 # Django
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django_guid import get_guid
 from django.utils.functional import cached_property
 from django.db import connections
@@ -18,8 +23,59 @@ from awx.main.queue import CallbackQueueDispatcher
 logger = logging.getLogger('awx.main.tasks.callback')
 
 
+def collect_queries(query_file_contents) -> dict:
+    """
+    collect_queries extracts host queries from the contents of
+    ansible_data.json
+    """
+    result = {}
+
+    try:
+        installed_collections = query_file_contents['installed_collections']
+    except KeyError:
+        logger.error("installed_collections missing in callback response")
+        return result
+
+    for key, value in installed_collections.items():
+        if 'host_query' in value and 'version' in value:
+            result[key] = value
+
+    return result
+
+
+COLLECTION_FILENAME = "ansible_data.json"
+
+
+def try_load_query_file(artifact_dir) -> Tuple[bool, Optional[dict]]:
+    """
+    try_load_query_file checks the artifact directory after job completion and
+    returns the contents of ansible_data.json if present
+    """
+
+    queries_path = os.path.join(artifact_dir, COLLECTION_FILENAME)
+    if not os.path.isfile(queries_path):
+        logger.info(f"no query file found: {queries_path}")
+        return False, None
+
+    try:
+        f = open(queries_path, "r")
+    except OSError as e:
+        logger.error(f"error opening query file {queries_path}: {e}")
+        return False, None
+
+    with f:
+        try:
+            queries = json.load(f)
+        except ValueError as e:
+            logger.error(f"error parsing query file {queries_path}: {e}")
+            return False, None
+
+        return True, queries
+
+
 class RunnerCallback:
     def __init__(self, model=None):
+        self.instance = None
         self.parent_workflow_job_id = None
         self.host_map = {}
         self.guid = get_guid()
@@ -29,9 +85,12 @@ class RunnerCallback:
         self.safe_env = {}
         self.event_ct = 0
         self.model = model
-        self.update_attempts = int(settings.DISPATCHER_DB_DOWNTOWN_TOLLERANCE / 5)
+        self.update_attempts = int(getattr(settings, 'DISPATCHER_DB_DOWNTOWN_TOLLERANCE', settings.DISPATCHER_DB_DOWNTIME_TOLERANCE) / 5)
         self.wrapup_event_dispatched = False
+        self.artifacts_processed = False
         self.extra_update_fields = {}
+        self.dedup_threshold = None  # skip events with counter <= this (safe contiguous range already in DB)
+        self.persisted_counters = None  # skip events in this set (collision zone: counters above threshold already in DB)
 
     def update_model(self, pk, _attempt=0, **updates):
         return update_model(self.model, pk, _attempt=0, _max_attempts=self.update_attempts, **updates)
@@ -64,6 +123,57 @@ class RunnerCallback:
             self.delay_update(result_traceback=ANSIBLE_RUNNER_NEEDS_UPDATE_MESSAGE)
         return self.extra_update_fields
 
+    def configure_for_job(self, instance, safe_env=None, dedup_threshold=None, persisted_counters=None):
+        """Initialize callback fields for event processing.
+
+        This is the single source of truth for RunnerCallback initialization, shared
+        between the normal job path (BaseTask.run) and adoption (reattach_to_work_unit).
+        Having both paths call this method means any missing field is caught by the
+        normal test suite rather than only by adoption-specific tests.
+
+        Args:
+            instance: the UnifiedJob model instance being run
+            safe_env: masked environment dict for log output. None → {} (adoption path,
+                where credentials are not available at reconnect time)
+            dedup_threshold: highest counter where all lower counters are in DB (contiguous
+                prefix). event_handler skips counter <= threshold with an O(1) check. None
+                disables dedup (normal jobs, zero overhead).
+            persisted_counters: small set of counters above dedup_threshold that are already
+                in DB (the collision zone from parallel callback worker races). Bounded by
+                worker concurrency, not job size. None when dedup is disabled.
+        """
+        self.instance = instance
+        self.job_created = str(instance.created)  # stamped on every event (callback.py:160)
+        self.safe_env = safe_env if safe_env is not None else {}
+        if getattr(instance, 'spawned_by_workflow', False):
+            try:
+                self.parent_workflow_job_id = instance.get_workflow_job().id
+            except Exception:
+                pass
+        self.dedup_threshold = dedup_threshold
+        self.persisted_counters = persisted_counters
+        # Populate host_map from inventory hostvars using the same logic as normal job path.
+        # This ensures adoption respects inventory types (smart, constructed, normal),
+        # enabled state, and job slicing — the same way write_inventory_file() does.
+        if hasattr(instance, 'inventory') and instance.inventory_id:
+            try:
+                script_params = {"hostvars": True, "towervars": True}
+                if hasattr(instance, 'job_slice_number'):
+                    script_params['slice_number'] = instance.job_slice_number
+                    script_params['slice_count'] = instance.job_slice_count
+                script_data = instance.inventory.get_script_data(**script_params)
+                for hostname, hv in script_data.get('_meta', {}).get('hostvars', {}).items():
+                    self.host_map[hostname] = hv.get('remote_tower_id', '')
+            except Exception:
+                pass  # host_map stays {}; host_id won't be set on replayed events
+
+    @classmethod
+    def create_for_job(cls, instance, safe_env=None, dedup_threshold=None, persisted_counters=None):
+        """Factory: create and configure a RunnerCallback for a job."""
+        callback = cls(model=type(instance))
+        callback.configure_for_job(instance, safe_env, dedup_threshold, persisted_counters)
+        return callback
+
     def event_handler(self, event_data):
         #
         # ⚠️  D-D-D-DANGER ZONE ⚠️
@@ -85,6 +195,15 @@ class RunnerCallback:
         # which generate job events from two 'streams':
         # ansible-inventory and the awx.main.commands.inventory_import
         # logger
+        if event_data.get('event') == 'keepalive':
+            return
+        if self.dedup_threshold is not None:
+            counter = event_data.get('counter')
+            if counter is not None:
+                if counter <= self.dedup_threshold:
+                    return  # contiguous safe range — all in DB, O(1) check
+                if self.persisted_counters and counter in self.persisted_counters:
+                    return  # collision zone — in DB but above threshold, O(small-set) check
 
         if event_data.get(self.event_data_key, None):
             if self.event_data_key != 'job_id':
@@ -92,17 +211,17 @@ class RunnerCallback:
         if self.parent_workflow_job_id:
             event_data['workflow_job_id'] = self.parent_workflow_job_id
         event_data['job_created'] = self.job_created
-        if self.host_map:
-            host = event_data.get('event_data', {}).get('host', '').strip()
-            if host:
-                event_data['host_name'] = host
-                if host in self.host_map:
-                    event_data['host_id'] = self.host_map[host]
-            else:
-                event_data['host_name'] = ''
-                event_data['host_id'] = ''
-            if event_data.get('event') == 'playbook_on_stats':
-                event_data['host_map'] = self.host_map
+
+        host = event_data.get('event_data', {}).get('host', '').strip()
+        if host:
+            event_data['host_name'] = host
+            if host in self.host_map:
+                event_data['host_id'] = self.host_map[host]
+        else:
+            event_data['host_name'] = ''
+            event_data['host_id'] = ''
+        if event_data.get('event') == 'playbook_on_stats':
+            event_data['host_map'] = self.host_map
 
         if isinstance(self, RunnerCallbackForProjectUpdate):
             # need a better way to have this check.
@@ -116,7 +235,7 @@ class RunnerCallback:
             # so it *should* have a negligible performance impact
             task = event_data.get('event_data', {}).get('task_action')
             try:
-                if task in ('git', 'svn'):
+                if task in ('git', 'svn', 'ansible.builtin.git', 'ansible.builtin.svn'):
                     event_data_json = json.dumps(event_data)
                     event_data_json = UriCleaner.remove_sensitive(event_data_json)
                     event_data = json.loads(event_data_json)
@@ -205,9 +324,40 @@ class RunnerCallback:
             # We opened a connection just for that save, close it here now
             connections.close_all()
         elif status_data['status'] == 'error':
-            result_traceback = status_data.get('result_traceback', None)
-            if result_traceback:
-                self.delay_update(result_traceback=result_traceback)
+            for field_name in ('result_traceback', 'job_explanation'):
+                field_value = status_data.get(field_name, None)
+                if field_value:
+                    self.delay_update(**{field_name: field_value})
+
+    def artifacts_handler(self, artifact_dir):
+        success, query_file_contents = try_load_query_file(artifact_dir)
+        if success:
+            if 'installed_collections' in query_file_contents:
+                self.delay_update(installed_collections=query_file_contents['installed_collections'])
+            else:
+                logger.warning(f'The file {COLLECTION_FILENAME} unexpectedly did not contain installed_collections')
+
+            if 'ansible_version' in query_file_contents:
+                self.delay_update(ansible_version=query_file_contents['ansible_version'])
+            else:
+                logger.warning(f'The file {COLLECTION_FILENAME} unexpectedly did not contain ansible_version')
+
+            if settings.INDIRECT_NODE_COUNTING_ENABLED:
+                self.delay_update(event_queries_processed=False)
+                collections_info = collect_queries(query_file_contents)
+                for collection, data in collections_info.items():
+                    version = data['version']
+                    event_query = data['host_query']
+                    instance = EventQuery(fqcn=collection, collection_version=version, event_query=event_query)
+                    try:
+                        instance.validate_unique()
+                        instance.save()
+
+                        logger.info(f"event query for collection {collection}, version {version} created")
+                    except ValidationError as e:
+                        logger.info(e)
+
+        self.artifacts_processed = True
 
 
 class RunnerCallbackForProjectUpdate(RunnerCallback):
@@ -219,7 +369,7 @@ class RunnerCallbackForProjectUpdate(RunnerCallback):
     def event_handler(self, event_data):
         super_return_value = super(RunnerCallbackForProjectUpdate, self).event_handler(event_data)
         returned_data = event_data.get('event_data', {})
-        if returned_data.get('task_action', '') == 'set_fact':
+        if returned_data.get('task_action', '') in ('set_fact', 'ansible.builtin.set_fact'):
             returned_facts = returned_data.get('res', {}).get('ansible_facts', {})
             if 'scm_version' in returned_facts:
                 self.playbook_new_revision = returned_facts['scm_version']

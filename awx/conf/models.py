@@ -7,9 +7,10 @@ import json
 # Django
 from django.db import models
 
+from ansible_base.lib.utils.models import prevent_search
+
 # AWX
-from awx.main.fields import JSONBlob
-from awx.main.models.base import CreatedModifiedModel, prevent_search
+from awx.main.models.base import CreatedModifiedModel
 from awx.main.utils import encrypt_field
 from awx.conf import settings_registry
 
@@ -18,7 +19,7 @@ __all__ = ['Setting']
 
 class Setting(CreatedModifiedModel):
     key = models.CharField(max_length=255)
-    value = JSONBlob(null=True)
+    value = models.JSONField(null=True)
     user = prevent_search(models.ForeignKey('auth.User', related_name='settings', default=None, null=True, editable=False, on_delete=models.CASCADE))
 
     def __str__(self):
@@ -26,11 +27,11 @@ class Setting(CreatedModifiedModel):
             json_value = json.dumps(self.value)
         except ValueError:
             # In the rare case the DB value is invalid JSON.
-            json_value = u'<Invalid JSON>'
+            json_value = '<Invalid JSON>'
         if self.user:
-            return u'{} ({}) = {}'.format(self.key, self.user, json_value)
+            return '{} ({}) = {}'.format(self.key, self.user, json_value)
         else:
-            return u'{} = {}'.format(self.key, json_value)
+            return '{} = {}'.format(self.key, json_value)
 
     def save(self, *args, **kwargs):
         encrypted = settings_registry.is_setting_encrypted(self.key)

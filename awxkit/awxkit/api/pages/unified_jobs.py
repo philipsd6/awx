@@ -40,7 +40,7 @@ class UnifiedJob(HasStatus, base.Base):
         Default behavior is to replace newline characters with a space, but this can be modified, including replacement
         with ''. Pass replace_newlines=None to disable.
 
-        Additionally, you may replace any ' ' with another character (including ''). This is applied after the newline
+        Additionally, you may replace any  with another character (including ''). This is applied after the newline
         replacement. Default behavior is to not replace spaces.
         """
         self.wait_until_completed()
@@ -139,15 +139,18 @@ class UnifiedJob(HasStatus, base.Base):
         """
         self.get()
         job_args = self.job_args
-        expected_prefix = '/tmp/awx_{}'.format(self.id)
+        expected_segment = 'awx_{}'.format(self.id)
         for arg1, arg2 in zip(job_args[:-1], job_args[1:]):
             if arg1 == '-v':
                 if ':' in arg2:
                     host_loc = arg2.split(':')[0]
-                    if host_loc.startswith(expected_prefix):
+                    parts = host_loc.rstrip('/').split('/')
+                    if any(p == expected_segment or p.startswith(expected_segment + '_') for p in parts):
                         return host_loc
         raise RuntimeError(
-            'Could not find a controller private_data_dir for this job. ' 'Searched for volume mount to {} inside of args {}'.format(expected_prefix, job_args)
+            'Could not find a controller private_data_dir for this job. Searched for volume mount matching {} inside of args {}'.format(
+                expected_segment, job_args
+            )
         )
 
 

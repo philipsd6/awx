@@ -12,25 +12,13 @@ from awx.api.versioning import reverse
 EXAMPLE_PRIVATE_KEY = '-----BEGIN PRIVATE KEY-----\nxyz==\n-----END PRIVATE KEY-----'
 EXAMPLE_ENCRYPTED_PRIVATE_KEY = '-----BEGIN PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nxyz==\n-----END PRIVATE KEY-----'
 
-
-@pytest.mark.django_db
-def test_idempotent_credential_type_setup():
-    assert CredentialType.objects.count() == 0
-    CredentialType.setup_tower_managed_defaults()
-    total = CredentialType.objects.count()
-    assert total > 0
-
-    CredentialType.setup_tower_managed_defaults()
-    assert CredentialType.objects.count() == total
-
-
 #
 # user credential creation
 #
 
 
 @pytest.mark.django_db
-def test_create_user_credential_via_credentials_list(post, get, alice, credentialtype_ssh):
+def test_create_user_credential_via_credentials_list(post, get, alice, credentialtype_ssh, setup_managed_roles):
     params = {
         'credential_type': 1,
         'inputs': {'username': 'someusername'},
@@ -77,11 +65,11 @@ def test_credential_validation_error_with_multiple_owner_fields(post, admin, ali
     }
     response = post(reverse('api:credential_list'), params, admin)
     assert response.status_code == 400
-    assert response.data['detail'][0] == ("Only one of 'user', 'team', or 'organization' should be provided, " "received organization, team, user fields.")
+    assert response.data['detail'][0] == ("Only one of 'user', 'team', or 'organization' should be provided, received organization, team, user fields.")
 
 
 @pytest.mark.django_db
-def test_create_user_credential_via_user_credentials_list(post, get, alice, credentialtype_ssh):
+def test_create_user_credential_via_user_credentials_list(post, get, alice, credentialtype_ssh, setup_managed_roles):
     params = {
         'credential_type': 1,
         'inputs': {'username': 'someusername'},
@@ -212,6 +200,7 @@ def test_grant_org_credential_to_org_user_through_user_roles(post, credential, o
 
 @pytest.mark.django_db
 def test_grant_org_credential_to_non_org_user_through_role_users(post, credential, organization, org_admin, alice):
+    # NOTE: this endpoint is going away soon
     credential.organization = organization
     credential.save()
     response = post(reverse('api:role_users_list', kwargs={'pk': credential.use_role.id}), {'id': alice.id}, org_admin)
@@ -220,6 +209,7 @@ def test_grant_org_credential_to_non_org_user_through_role_users(post, credentia
 
 @pytest.mark.django_db
 def test_grant_org_credential_to_non_org_user_through_user_roles(post, credential, organization, org_admin, alice):
+    # NOTE: this endpoint is going away soon
     credential.organization = organization
     credential.save()
     response = post(reverse('api:user_roles_list', kwargs={'pk': alice.id}), {'id': credential.use_role.id}, org_admin)
@@ -228,18 +218,18 @@ def test_grant_org_credential_to_non_org_user_through_user_roles(post, credentia
 
 @pytest.mark.django_db
 def test_grant_private_credential_to_user_through_role_users(post, credential, alice, bob):
-    # normal users can't do this
+    # NOTE: this endpoint is going away soon
     credential.admin_role.members.add(alice)
     response = post(reverse('api:role_users_list', kwargs={'pk': credential.use_role.id}), {'id': bob.id}, alice)
-    assert response.status_code == 400
+    assert response.status_code == 403
 
 
 @pytest.mark.django_db
 def test_grant_private_credential_to_org_user_through_role_users(post, credential, org_admin, org_member):
-    # org admins can't either
+    # NOTE: this endpoint is going away soon
     credential.admin_role.members.add(org_admin)
     response = post(reverse('api:role_users_list', kwargs={'pk': credential.use_role.id}), {'id': org_member.id}, org_admin)
-    assert response.status_code == 400
+    assert response.status_code == 204
 
 
 @pytest.mark.django_db
@@ -251,18 +241,18 @@ def test_sa_grant_private_credential_to_user_through_role_users(post, credential
 
 @pytest.mark.django_db
 def test_grant_private_credential_to_user_through_user_roles(post, credential, alice, bob):
-    # normal users can't do this
+    # NOTE: this endpoint is going away soon
     credential.admin_role.members.add(alice)
     response = post(reverse('api:user_roles_list', kwargs={'pk': bob.id}), {'id': credential.use_role.id}, alice)
-    assert response.status_code == 400
+    assert response.status_code == 403
 
 
 @pytest.mark.django_db
 def test_grant_private_credential_to_org_user_through_user_roles(post, credential, org_admin, org_member):
-    # org admins can't either
+    # NOTE: this endpoint is going away soon
     credential.admin_role.members.add(org_admin)
     response = post(reverse('api:user_roles_list', kwargs={'pk': org_member.id}), {'id': credential.use_role.id}, org_admin)
-    assert response.status_code == 400
+    assert response.status_code == 204
 
 
 @pytest.mark.django_db
@@ -294,9 +284,69 @@ def test_grant_org_credential_to_team_through_team_roles(post, credential, organ
 
 @pytest.mark.django_db
 def test_sa_grant_private_credential_to_team_through_role_teams(post, credential, admin, team):
-    # not even a system admin can grant a private cred to a team though
+    # NOTE: this endpoint is going away soon
     response = post(reverse('api:role_teams_list', kwargs={'pk': credential.use_role.id}), {'id': team.id}, admin)
+    assert response.status_code == 204
+
+
+@pytest.mark.django_db
+def test_grant_credential_to_team_different_organization_through_role_teams(post, get, credential, organizations, admin, org_admin, team, team_member):
+    # NOTE: this endpoint is going away soon
+    orgs = organizations(2)
+    credential.organization = orgs[0]
+    credential.save()
+    team.organization = orgs[1]
+    team.save()
+
+    # Non-superuser (org_admin) trying cross-org assignment should be denied
+    response = post(reverse('api:role_teams_list', kwargs={'pk': credential.use_role.id}), {'id': team.id}, org_admin)
     assert response.status_code == 400
+    assert "You cannot grant credential access to a Team not in the credentials' organization" in str(response.data['detail'])
+
+    # Superuser (admin) can do cross-org assignment
+    response = post(reverse('api:role_teams_list', kwargs={'pk': credential.use_role.id}), {'id': team.id}, admin)
+    assert response.status_code == 204
+
+    assert credential.use_role in team.member_role.children.all()
+    assert team_member in credential.read_role
+    assert team_member in credential.use_role
+    assert team_member not in credential.admin_role
+
+
+@pytest.mark.django_db
+def test_grant_credential_to_team_different_organization(post, get, credential, organizations, admin, org_admin, team, team_member):
+    # NOTE: this endpoint is going away soon
+    orgs = organizations(2)
+    credential.organization = orgs[0]
+    credential.save()
+    team.organization = orgs[1]
+    team.save()
+
+    # Non-superuser (org_admin) trying cross-org assignment should be denied
+    response = post(reverse('api:team_roles_list', kwargs={'pk': team.id}), {'id': credential.use_role.id}, org_admin)
+    assert response.status_code == 400
+    assert "You cannot grant credential access to a Team not in the credentials' organization" in str(response.data['detail'])
+
+    # Superuser (system admin) can do cross-org assignment
+    response = post(reverse('api:team_roles_list', kwargs={'pk': team.id}), {'id': credential.use_role.id}, admin)
+    assert response.status_code == 204
+
+    assert credential.use_role in team.member_role.children.all()
+
+    assert team_member in credential.read_role
+    assert team_member in credential.use_role
+    assert team_member not in credential.admin_role
+
+    # Team member can see the credential in API
+    response = get(reverse('api:team_credentials_list', kwargs={'pk': team.id}), team_member)
+    assert response.status_code == 200
+    assert response.data['count'] == 1
+    assert response.data['results'][0]['id'] == credential.id
+
+    # Team member can see the credential in general credentials API
+    response = get(reverse('api:credential_list'), team_member)
+    assert response.status_code == 200
+    assert any(cred['id'] == credential.id for cred in response.data['results'])
 
 
 @pytest.mark.django_db
@@ -385,10 +435,9 @@ def test_list_created_org_credentials(post, get, organization, org_admin, org_me
 @pytest.mark.django_db
 def test_list_cannot_order_by_encrypted_field(post, get, organization, org_admin, credentialtype_ssh, order_by):
     for i, password in enumerate(('abc', 'def', 'xyz')):
-        response = post(reverse('api:credential_list'), {'organization': organization.id, 'name': 'C%d' % i, 'password': password}, org_admin)
+        post(reverse('api:credential_list'), {'organization': organization.id, 'name': 'C%d' % i, 'password': password}, org_admin, expect=400)
 
-    response = get(reverse('api:credential_list'), org_admin, QUERY_STRING='order_by=%s' % order_by, status=400)
-    assert response.status_code == 400
+    get(reverse('api:credential_list'), org_admin, QUERY_STRING='order_by=%s' % order_by, expect=400)
 
 
 @pytest.mark.django_db
@@ -399,8 +448,7 @@ def test_inputs_cannot_contain_extra_fields(get, post, organization, admin, cred
         'credential_type': credentialtype_ssh.pk,
         'inputs': {'invalid_field': 'foo'},
     }
-    response = post(reverse('api:credential_list'), params, admin)
-    assert response.status_code == 400
+    response = post(reverse('api:credential_list'), params, admin, expect=400)
     assert "'invalid_field' was unexpected" in response.data['inputs'][0]
 
 
@@ -882,7 +930,7 @@ def test_field_removal(put, organization, admin, credentialtype_ssh):
         },
     }
     cred = Credential(
-        credential_type=credentialtype_ssh, name='Best credential ever', organization=organization, inputs={'username': u'jim', 'password': u'secret'}
+        credential_type=credentialtype_ssh, name='Best credential ever', organization=organization, inputs={'username': 'jim', 'password': 'secret'}
     )
     cred.save()
 
@@ -909,7 +957,7 @@ def test_field_removal(put, organization, admin, credentialtype_ssh):
 )
 def test_credential_type_mutability(patch, organization, admin, credentialtype_ssh, credentialtype_aws, relation, related_obj):
     cred = Credential(
-        credential_type=credentialtype_ssh, name='Best credential ever', organization=organization, inputs={'username': u'jim', 'password': u'pass'}
+        credential_type=credentialtype_ssh, name='Best credential ever', organization=organization, inputs={'username': 'jim', 'password': 'pass'}
     )
     cred.save()
 
@@ -919,13 +967,13 @@ def test_credential_type_mutability(patch, organization, admin, credentialtype_s
     def _change_credential_type():
         return patch(
             reverse('api:credential_detail', kwargs={'pk': cred.pk}),
-            {'credential_type': credentialtype_aws.pk, 'inputs': {'username': u'jim', 'password': u'pass'}},
+            {'credential_type': credentialtype_aws.pk, 'inputs': {'username': 'jim', 'password': 'pass'}},
             admin,
         )
 
     response = _change_credential_type()
     assert response.status_code == 400
-    expected = ['You cannot change the credential type of the credential, ' 'as it may break the functionality of the resources using it.']
+    expected = ['You cannot change the credential type of the credential, as it may break the functionality of the resources using it.']
     assert response.data['credential_type'] == expected
 
     response = patch(reverse('api:credential_detail', kwargs={'pk': cred.pk}), {'name': 'Worst credential ever'}, admin)
@@ -944,7 +992,7 @@ def test_vault_credential_type_mutability(patch, organization, admin, credential
         name='Best credential ever',
         organization=organization,
         inputs={
-            'vault_password': u'some-vault',
+            'vault_password': 'some-vault',
         },
     )
     cred.save()
@@ -956,13 +1004,13 @@ def test_vault_credential_type_mutability(patch, organization, admin, credential
     def _change_credential_type():
         return patch(
             reverse('api:credential_detail', kwargs={'pk': cred.pk}),
-            {'credential_type': credentialtype_ssh.pk, 'inputs': {'username': u'jim', 'password': u'pass'}},
+            {'credential_type': credentialtype_ssh.pk, 'inputs': {'username': 'jim', 'password': 'pass'}},
             admin,
         )
 
     response = _change_credential_type()
     assert response.status_code == 400
-    expected = ['You cannot change the credential type of the credential, ' 'as it may break the functionality of the resources using it.']
+    expected = ['You cannot change the credential type of the credential, as it may break the functionality of the resources using it.']
     assert response.data['credential_type'] == expected
 
     response = patch(reverse('api:credential_detail', kwargs={'pk': cred.pk}), {'name': 'Worst credential ever'}, admin)
@@ -977,7 +1025,7 @@ def test_vault_credential_type_mutability(patch, organization, admin, credential
 @pytest.mark.django_db
 def test_cloud_credential_type_mutability(patch, organization, admin, credentialtype_ssh, credentialtype_aws):
     cred = Credential(
-        credential_type=credentialtype_aws, name='Best credential ever', organization=organization, inputs={'username': u'jim', 'password': u'pass'}
+        credential_type=credentialtype_aws, name='Best credential ever', organization=organization, inputs={'username': 'jim', 'password': 'pass'}
     )
     cred.save()
 
@@ -988,13 +1036,13 @@ def test_cloud_credential_type_mutability(patch, organization, admin, credential
     def _change_credential_type():
         return patch(
             reverse('api:credential_detail', kwargs={'pk': cred.pk}),
-            {'credential_type': credentialtype_ssh.pk, 'inputs': {'username': u'jim', 'password': u'pass'}},
+            {'credential_type': credentialtype_ssh.pk, 'inputs': {'username': 'jim', 'password': 'pass'}},
             admin,
         )
 
     response = _change_credential_type()
     assert response.status_code == 400
-    expected = ['You cannot change the credential type of the credential, ' 'as it may break the functionality of the resources using it.']
+    expected = ['You cannot change the credential type of the credential, as it may break the functionality of the resources using it.']
     assert response.data['credential_type'] == expected
 
     response = patch(reverse('api:credential_detail', kwargs={'pk': cred.pk}), {'name': 'Worst credential ever'}, admin)
@@ -1036,7 +1084,7 @@ def test_ssh_unlock_needed(put, organization, admin, credentialtype_ssh):
         credential_type=credentialtype_ssh,
         name='Best credential ever',
         organization=organization,
-        inputs={'username': u'joe', 'ssh_key_data': EXAMPLE_ENCRYPTED_PRIVATE_KEY, 'ssh_key_unlock': 'unlock'},
+        inputs={'username': 'joe', 'ssh_key_data': EXAMPLE_ENCRYPTED_PRIVATE_KEY, 'ssh_key_unlock': 'unlock'},
     )
     cred.save()
 
@@ -1062,7 +1110,7 @@ def test_ssh_unlock_not_needed(put, organization, admin, credentialtype_ssh):
         name='Best credential ever',
         organization=organization,
         inputs={
-            'username': u'joe',
+            'username': 'joe',
             'ssh_key_data': EXAMPLE_PRIVATE_KEY,
         },
     )
@@ -1089,7 +1137,7 @@ def test_ssh_unlock_with_prior_value(put, organization, admin, credentialtype_ss
         credential_type=credentialtype_ssh,
         name='Best credential ever',
         organization=organization,
-        inputs={'username': u'joe', 'ssh_key_data': EXAMPLE_ENCRYPTED_PRIVATE_KEY, 'ssh_key_unlock': 'old-unlock'},
+        inputs={'username': 'joe', 'ssh_key_data': EXAMPLE_ENCRYPTED_PRIVATE_KEY, 'ssh_key_unlock': 'old-unlock'},
     )
     cred.save()
 
@@ -1117,7 +1165,7 @@ def test_ssh_bad_key_unlock_not_checked(put, organization, admin, credentialtype
         name='Best credential ever',
         organization=organization,
         inputs={
-            'username': u'oscar',
+            'username': 'oscar',
             'ssh_key_data': 'invalid-key',
             'ssh_key_unlock': 'unchecked-unlock',
         },
@@ -1203,7 +1251,7 @@ def test_secret_encryption_previous_value(patch, organization, admin, credential
         }
     }
     cred = Credential(
-        credential_type=credentialtype_ssh, name='Best credential ever', organization=organization, inputs={'username': u'jim', 'password': u'secret'}
+        credential_type=credentialtype_ssh, name='Best credential ever', organization=organization, inputs={'username': 'jim', 'password': 'secret'}
     )
     cred.save()
 
@@ -1236,6 +1284,30 @@ def test_custom_credential_type_create(get, post, organization, admin):
     cred = Credential.objects.all()[:1].get()
     assert cred.inputs['api_token'].startswith('$encrypted$UTF8$AES')
     assert decrypt_field(cred, 'api_token') == 'secret'
+
+
+@pytest.mark.django_db
+def test_galaxy_create_ok(post, organization, admin):
+    params = {
+        'credential_type': 1,
+        'name': 'Galaxy credential',
+        'inputs': {
+            'url': 'https://galaxy.ansible.com',
+            'token': 'some_galaxy_token',
+        },
+    }
+    galaxy = CredentialType.defaults['galaxy_api_token']()
+    galaxy.save()
+    params['user'] = admin.id
+    params['credential_type'] = galaxy.pk
+    response = post(reverse('api:credential_list'), params, admin)
+    assert response.status_code == 201
+
+    assert Credential.objects.count() == 1
+    cred = Credential.objects.all()[:1].get()
+    assert cred.credential_type == galaxy
+    assert cred.inputs['url'] == 'https://galaxy.ansible.com'
+    assert decrypt_field(cred, 'token') == 'some_galaxy_token'
 
 
 #
@@ -1286,3 +1358,96 @@ def test_external_credential_rbac_test_endpoint(post, alice, external_credential
 
     external_credential.use_role.members.add(alice)
     assert post(url, data, alice).status_code == 202
+
+
+#
+# CleanTextMixin on Credential.inputs (AAP-78694)
+#
+# Nested JSON strings always go through Tier 2. These tests only assert which
+# keys are skipped: credential_type.secret_fields are excluded per-request via
+# instance excluded_json_keys; everything else is still validated.
+#
+
+UNSAFE_INPUT = '<script>x</script>'
+
+
+@pytest.fixture
+def enforce_clean_text():
+    with mock.patch('ansible_base.lib.serializers.mixins.get_setting', return_value=True):
+        yield
+
+
+@pytest.mark.django_db
+def test_credential_inputs_rejects_unsafe_non_secret_key(post, admin, credentialtype_ssh, enforce_clean_text):
+    assert 'username' not in credentialtype_ssh.secret_fields
+    response = post(
+        reverse('api:credential_list'),
+        {
+            'name': 'ssh-cleantext-username',
+            'credential_type': credentialtype_ssh.id,
+            'user': admin.id,
+            'inputs': {'username': UNSAFE_INPUT, 'password': UNSAFE_INPUT},
+        },
+        admin,
+    )
+    assert response.status_code == 400
+    assert 'username' in response.data['inputs']
+    assert 'password' not in response.data['inputs']
+
+
+@pytest.mark.django_db
+def test_credential_inputs_skips_secret_keys(post, admin, credentialtype_ssh, enforce_clean_text):
+    assert 'password' in credentialtype_ssh.secret_fields
+    response = post(
+        reverse('api:credential_list'),
+        {
+            'name': 'ssh-cleantext-password',
+            'credential_type': credentialtype_ssh.id,
+            'user': admin.id,
+            'inputs': {'username': 'ok-user', 'password': UNSAFE_INPUT},
+        },
+        admin,
+    )
+    assert response.status_code == 201
+
+
+@pytest.mark.django_db
+def test_credential_inputs_secret_fields_follow_custom_type_schema(post, admin, organization, enforce_clean_text):
+    credential_type = CredentialType(
+        kind='cloud',
+        name='CustomCleanTextType',
+        inputs={
+            'fields': [
+                {'id': 'endpoint', 'label': 'Endpoint', 'type': 'string'},
+                {'id': 'token', 'label': 'Token', 'type': 'string', 'secret': True},
+            ]
+        },
+    )
+    credential_type.save()
+    assert credential_type.secret_fields == ['token']
+
+    rejected = post(
+        reverse('api:credential_list'),
+        {
+            'name': 'custom-cleantext-endpoint',
+            'organization': organization.pk,
+            'credential_type': credential_type.pk,
+            'inputs': {'endpoint': UNSAFE_INPUT, 'token': 'ok-token'},
+        },
+        admin,
+    )
+    assert rejected.status_code == 400
+    assert 'endpoint' in rejected.data['inputs']
+    assert 'token' not in rejected.data['inputs']
+
+    accepted = post(
+        reverse('api:credential_list'),
+        {
+            'name': 'custom-cleantext-token',
+            'organization': organization.pk,
+            'credential_type': credential_type.pk,
+            'inputs': {'endpoint': 'https://example.invalid', 'token': UNSAFE_INPUT},
+        },
+        admin,
+    )
+    assert accepted.status_code == 201

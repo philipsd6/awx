@@ -38,17 +38,17 @@ options:
       type: dict
     target_credential:
       description:
-        - The credential which will have its input defined by this source
+        - The credential name, ID, or named URL which will have its input defined by this source
       required: true
       type: str
     source_credential:
       description:
-        - The credential which is the source of the credential lookup
+        - The credential name, ID, or named URL which is the source of the credential lookup
       type: str
     state:
       description:
         - Desired state of the resource.
-      choices: ["present", "absent"]
+      choices: ["present", "absent", "exists"]
       default: "present"
       type: str
 
@@ -66,7 +66,6 @@ EXAMPLES = '''
       object_query: "Safe=MY_SAFE;Object=awxuser"
       object_query_format: "Exact"
     state: present
-
 '''
 
 from ..module_utils.controller_api import ControllerAPIModule
@@ -80,7 +79,7 @@ def main():
         target_credential=dict(required=True),
         source_credential=dict(),
         metadata=dict(type="dict"),
-        state=dict(choices=['present', 'absent'], default='present'),
+        state=dict(choices=['present', 'absent', 'exists'], default='present'),
     )
 
     # Create a module for ourselves
@@ -94,14 +93,22 @@ def main():
     metadata = module.params.get('metadata')
     state = module.params.get('state')
 
-    target_credential_id = module.resolve_name_to_id('credentials', target_credential)
+    # The target credential lookup should not fail if the target credential is absent and the
+    # state on the credential input source is also absent. If the credential input source has a
+    # state of present, then this should fail as the target credential cannot be nonexistent.
+    target_credential_lookup = module.get_one('credentials', name_or_id=target_credential, allow_none=(state == 'absent'))
+
+    if target_credential_lookup is None:
+        module.exit_json(**{'changed': False})
+    else:
+        target_credential_id = target_credential_lookup['id']
 
     # Attempt to look up the object based on the target credential and input field
     lookup_data = {
         'target_credential': target_credential_id,
         'input_field_name': input_field_name,
     }
-    credential_input_source = module.get_one('credential_input_sources', **{'data': lookup_data})
+    credential_input_source = module.get_one('credential_input_sources', check_exists=(state == 'exists'), **{'data': lookup_data})
 
     if state == 'absent':
         module.delete_if_needed(credential_input_source)

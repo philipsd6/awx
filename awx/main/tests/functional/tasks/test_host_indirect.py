@@ -1,0 +1,622 @@
+import yaml
+from functools import reduce
+from unittest import mock
+
+import pytest
+
+from django.db import transaction
+from django.utils.timezone import now, timedelta
+
+from awx.main.models import Job
+
+from awx.main.tasks.host_indirect import (
+    _execute_jq_query,
+    _resolve_event_query,
+    _process_jq_result,
+    build_indirect_host_data,
+    fetch_job_event_query,
+    save_indirect_host_entries,
+    cleanup_and_save_indirect_host_entries_fallback,
+)
+from awx.main.tasks.system import events_processed_hook
+from awx.main.models.event_query import EventQuery
+from awx.main.models.indirect_managed_node_audit import IndirectManagedNodeAudit
+
+"""These are unit tests, similar to test_indirect_host_counting in the live tests"""
+
+
+TEST_JQ = "{name: .name, canonical_facts: {host_name: .direct_host_name}, facts: {another_host_name: .direct_host_name}}"
+
+
+class Query(dict):
+    def __init__(self, resolved_action: str, query_jq: dict):
+        self._resolved_action = resolved_action.split('.')
+        self._collection_ns, self._collection_name, self._module_name = self._resolved_action
+
+        super().__init__({self.resolve_key: {'query': query_jq}})
+
+    def get_fqcn(self):
+        return f'{self._collection_ns}.{self._collection_name}'
+
+    @property
+    def resolve_value(self):
+        return self[self.resolve_key]
+
+    @property
+    def resolve_key(self):
+        return f'{self.get_fqcn()}.{self._module_name}'
+
+    def resolve(self, module_name=None):
+        return {f'{self.get_fqcn()}.{module_name or self._module_name}': self.resolve_value}
+
+    def create_event_query(self, module_name=None):
+        if (module_name := module_name or self._module_name) == '*':
+            raise ValueError('Invalid module name *')
+        return self.create_event_queries([module_name])
+
+    def create_event_queries(self, module_names):
+        queries = {}
+        for name in module_names:
+            queries |= self.resolve(name)
+        return EventQuery.objects.create(
+            fqcn=self.get_fqcn(),
+            collection_version='1.0.1',
+            event_query=yaml.dump(queries, default_flow_style=False),
+        )
+
+    def create_registered_event(self, job, module_name):
+        job.job_events.create(event_data={'resolved_action': f'{self.get_fqcn()}.{module_name}', 'res': {'direct_host_name': 'foo_host', 'name': 'vm-foo'}})
+
+
+@pytest.fixture
+def bare_job(job_factory):
+    job = job_factory()
+    job.installed_collections = {'demo.query': {'version': '1.0.1'}, 'demo2.query': {'version': '1.0.1'}}
+    job.event_queries_processed = False
+    job.save(update_fields=['installed_collections', 'event_queries_processed'])
+    return job
+
+
+def create_registered_event(job, task_name='demo.query.example'):
+    return job.job_events.create(event_data={'resolved_action': task_name, 'res': {'direct_host_name': 'foo_host', 'name': 'vm-foo'}})
+
+
+@pytest.fixture
+def job_with_counted_event(bare_job):
+    create_registered_event(bare_job)
+    return bare_job
+
+
+def create_audit_record(name, job, organization, created=now()):
+    record = IndirectManagedNodeAudit.objects.create(name=name, job=job, organization=organization)
+    record.created = created
+    record.save()
+    return record
+
+
+@pytest.mark.django_db
+def test_save_indirect_host_entries_skips_when_disabled(bare_job, event_query, settings):
+    create_registered_event(bare_job)
+    settings.INDIRECT_NODE_COUNTING_ENABLED = False
+
+    save_indirect_host_entries(bare_job.id, wait_for_events=False)
+
+    bare_job.refresh_from_db()
+    assert bare_job.event_queries_processed is True
+    assert not IndirectManagedNodeAudit.objects.filter(job=bare_job).exists()
+
+
+@pytest.mark.django_db
+def test_events_processed_hook_discards_pending_counting_when_disabled(bare_job, settings, mocker):
+    settings.INDIRECT_NODE_COUNTING_ENABLED = False
+    mock_delay = mocker.patch('awx.main.tasks.system.save_indirect_host_entries.delay')
+    mock_refresh = mocker.patch.object(bare_job, 'refresh_from_db')
+    mocker.patch('awx.main.models.notifications.JobNotificationMixin.send_notification_templates')
+
+    events_processed_hook(bare_job)
+
+    assert Job.objects.get(id=bare_job.id).event_queries_processed is True
+    mock_refresh.assert_not_called()
+    mock_delay.assert_not_called()
+
+
+@pytest.fixture
+def event_query():
+    "This is ordinarily created by the artifacts callback"
+    return Query('demo.query.example', TEST_JQ).create_event_query()
+
+
+@pytest.fixture
+def old_audit_record(bare_job, organization):
+    created_at = now() - timedelta(days=10)
+    return create_audit_record(name="old_job", job=bare_job, organization=organization, created=created_at)
+
+
+@pytest.fixture
+def new_audit_record(bare_job, organization):
+    return IndirectManagedNodeAudit.objects.create(name="new_job", job=bare_job, organization=organization)
+
+
+# ---- end fixtures ----
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'queries,expected_matches',
+    (
+        pytest.param(
+            [],
+            0,
+            id='no_results',
+        ),
+        pytest.param(
+            [Query('demo.query.example', TEST_JQ)],
+            1,
+            id='fully_qualified',
+        ),
+        pytest.param(
+            [Query('demo.query.*', TEST_JQ)],
+            1,
+            id='wildcard',
+        ),
+        pytest.param(
+            [
+                Query('demo.query.*', TEST_JQ),
+                Query('demo.query.example', TEST_JQ),
+            ],
+            1,
+            id='wildcard_and_fully_qualified',
+        ),
+        pytest.param(
+            [
+                Query('demo.query.*', TEST_JQ),
+                Query('demo.query.example', {}),
+            ],
+            0,
+            id='wildcard_and_fully_qualified',
+        ),
+        pytest.param(
+            [
+                Query('demo.query.example', {}),
+                Query('demo.query.*', TEST_JQ),
+            ],
+            0,
+            id='ordering_should_not_matter',
+        ),
+    ),
+)
+def test_build_indirect_host_data(job_with_counted_event, queries: Query, expected_matches: int):
+    data = build_indirect_host_data(job_with_counted_event, {k: v for d in queries for k, v in d.items()}, mock.MagicMock())
+    assert len(data) == expected_matches
+
+
+@mock.patch('awx.main.tasks.host_indirect.logger.debug')
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'task_name',
+    (
+        pytest.param(
+            'demo.query',
+            id='no_results',
+        ),
+        pytest.param(
+            'demo',
+            id='no_results',
+        ),
+        pytest.param(
+            'a.b.c.d',
+            id='no_results',
+        ),
+    ),
+)
+def test_build_indirect_host_data_malformed_module_name(mock_logger_debug, bare_job, task_name: str):
+    create_registered_event(bare_job, task_name)
+    assert build_indirect_host_data(bare_job, Query('demo.query.example', TEST_JQ), mock.MagicMock()) == []
+    mock_logger_debug.assert_called_once_with(f"Malformed invocation module name '{task_name}'. Expected to be of the form 'a.b.c'")
+
+
+@mock.patch('awx.main.tasks.host_indirect.logger.info')
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'query',
+    (
+        pytest.param(
+            'demo.query',
+            id='no_results',
+        ),
+        pytest.param(
+            'demo',
+            id='no_results',
+        ),
+        pytest.param(
+            'a.b.c.d',
+            id='no_results',
+        ),
+    ),
+)
+def test_build_indirect_host_data_malformed_query(mock_logger_info, job_with_counted_event, query: str):
+    assert build_indirect_host_data(job_with_counted_event, {query: {'query': TEST_JQ}}, mock.MagicMock()) == []
+    mock_logger_info.assert_called_once_with(f"Skiping malformed query '{query}'. Expected to be of the form 'a.b.c'")
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'query',
+    (
+        pytest.param(
+            Query('demo.query.example', TEST_JQ),
+            id='fully_qualified',
+        ),
+        pytest.param(
+            Query('demo.query.*', TEST_JQ),
+            id='wildcard',
+        ),
+    ),
+)
+def test_fetch_job_event_query(bare_job, query: Query):
+    query.create_event_query(module_name='example')
+    assert fetch_job_event_query(bare_job) == query.resolve('example')
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'queries',
+    (
+        [
+            Query('demo.query.example', TEST_JQ),
+            Query('demo2.query.example', TEST_JQ),
+        ],
+        [
+            Query('demo.query.*', TEST_JQ),
+            Query('demo2.query.example', TEST_JQ),
+        ],
+    ),
+)
+def test_fetch_multiple_job_event_query(bare_job, queries: list[Query]):
+    for q in queries:
+        q.create_event_query(module_name='example')
+    assert fetch_job_event_query(bare_job) == reduce(lambda acc, q: acc | q.resolve('example'), queries, {})
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('state',),
+    (
+        pytest.param(
+            [
+                (
+                    Query('demo.query.example', TEST_JQ),
+                    ['example'],
+                ),
+            ],
+            id='fully_qualified',
+        ),
+        pytest.param(
+            [
+                (
+                    Query('demo.query.example', TEST_JQ),
+                    ['example'] * 3,
+                ),
+            ],
+            id='multiple_events_same_module_same_host',
+        ),
+        pytest.param(
+            [
+                (
+                    Query('demo.query.example', TEST_JQ),
+                    ['example'],
+                ),
+                (
+                    Query('demo2.query.example', TEST_JQ),
+                    ['example'],
+                ),
+            ],
+            id='multiple_modules',
+        ),
+        pytest.param(
+            [
+                (
+                    Query('demo.query.*', TEST_JQ),
+                    ['example', 'example2'],
+                ),
+            ],
+            id='multiple_modules_same_collection',
+        ),
+    ),
+)
+def test_save_indirect_host_entries(bare_job, state):
+    all_task_names = []
+    for entry in state:
+        query, module_names = entry
+        all_task_names.extend([f'{query.get_fqcn()}.{module_name}' for module_name in module_names])
+        query.create_event_queries(module_names)
+        [query.create_registered_event(bare_job, n) for n in module_names]
+
+    save_indirect_host_entries(bare_job.id)
+    bare_job.refresh_from_db()
+
+    assert bare_job.event_queries_processed is True
+
+    assert IndirectManagedNodeAudit.objects.filter(job=bare_job).count() == 1
+    host_audit = IndirectManagedNodeAudit.objects.filter(job=bare_job).first()
+
+    assert host_audit.count == len(all_task_names)
+    assert host_audit.canonical_facts == {'host_name': 'foo_host'}
+    assert host_audit.facts == {'another_host_name': 'foo_host'}
+    assert host_audit.organization == bare_job.organization
+    assert host_audit.name == 'vm-foo'
+    assert set(host_audit.events) == set(all_task_names)
+
+
+@pytest.mark.django_db
+def test_events_not_fully_processed_no_op(bare_job):
+    # I have a job that produced 12 events, but those are not saved
+    bare_job.emitted_events = 12
+    bare_job.finished = now()
+    bare_job.save(update_fields=['emitted_events', 'finished'])
+
+    # Running the normal post-run task will do nothing at this point
+    assert bare_job.event_queries_processed is False
+    with mock.patch('time.sleep'):  # for test speedup
+        save_indirect_host_entries(bare_job.id)
+    bare_job.refresh_from_db()
+    assert bare_job.event_queries_processed is False
+
+    # Right away, the fallback processing will not run either
+    cleanup_and_save_indirect_host_entries_fallback()
+    bare_job.refresh_from_db()
+    assert bare_job.event_queries_processed is False
+
+    # After 3 hours have passed...
+    bare_job.finished = now() - timedelta(hours=3)
+
+    # Create the expected job events
+    for _ in range(12):
+        create_registered_event(bare_job)
+
+    bare_job.save(update_fields=['finished'])
+
+    # The fallback task will now process indirect host query data for this job
+    cleanup_and_save_indirect_host_entries_fallback()
+
+    # Test code to process anyway, events collected or not
+    save_indirect_host_entries(bare_job.id, wait_for_events=False)
+    bare_job.refresh_from_db()
+    assert bare_job.event_queries_processed is True
+
+
+@pytest.mark.django_db
+def test_job_id_does_not_exist():
+    save_indirect_host_entries(10000001)
+
+
+@pytest.mark.django_db
+def test_cleanup_old_audit_records(old_audit_record, new_audit_record):
+    count_before_cleanup = IndirectManagedNodeAudit.objects.count()
+    assert count_before_cleanup == 2
+    cleanup_and_save_indirect_host_entries_fallback()
+    count_after_cleanup = IndirectManagedNodeAudit.objects.count()
+    assert count_after_cleanup == 1
+
+
+@mock.patch('awx.main.tasks.host_indirect.logger.warning')
+@pytest.mark.django_db
+def test_null_name_event_skipped_with_warning(mock_logger_warning, bare_job, event_query):
+    """Event with name=None should be skipped and a warning logged once."""
+    bare_job.job_events.create(
+        event_data={
+            'resolved_action': 'demo.query.example',
+            'res': {'direct_host_name': 'foo_host', 'name': None},
+        }
+    )
+    query = Query('demo.query.example', TEST_JQ)
+    records = build_indirect_host_data(bare_job, query, mock.MagicMock())
+    assert records == []
+    mock_logger_warning.assert_called_once()
+    assert 'missing name' in mock_logger_warning.call_args[0][0]
+
+
+@pytest.mark.django_db
+def test_mixed_valid_and_null_name_events(bare_job, event_query):
+    """Job with one valid and one null-name event: valid record persists, null-name is skipped."""
+    bare_job.job_events.create(
+        event_data={
+            'resolved_action': 'demo.query.example',
+            'res': {'direct_host_name': 'foo_host', 'name': 'vm-foo'},
+        }
+    )
+    bare_job.job_events.create(
+        event_data={
+            'resolved_action': 'demo.query.example',
+            'res': {'direct_host_name': 'bar_host', 'name': None},
+        }
+    )
+    save_indirect_host_entries(bare_job.id, wait_for_events=False)
+    bare_job.refresh_from_db()
+
+    assert bare_job.event_queries_processed is True
+    assert IndirectManagedNodeAudit.objects.filter(job=bare_job).count() == 1
+    audit = IndirectManagedNodeAudit.objects.get(job=bare_job)
+    assert audit.name == 'vm-foo'
+
+
+@pytest.mark.django_db
+def test_save_failure_leaves_flag_false(bare_job, event_query):
+    """If bulk_create raises, event_queries_processed must remain False for fallback retry."""
+    create_registered_event(bare_job)
+
+    with mock.patch.object(IndirectManagedNodeAudit.objects, 'bulk_create', side_effect=RuntimeError('db error')):
+        save_indirect_host_entries(bare_job.id, wait_for_events=False)
+
+    bare_job.refresh_from_db()
+    assert bare_job.event_queries_processed is False
+
+
+@pytest.mark.django_db
+def test_execute_jq_query_success():
+    """Successful jq execution returns results and records timing."""
+    compiled_jq = mock.MagicMock()
+    compiled_jq.input.return_value.all.return_value = [{'name': 'vm-1'}]
+    s_metrics = mock.MagicMock()
+
+    result = _execute_jq_query(compiled_jq, {'host': 'foo'}, 'demo.query.example', 42, s_metrics)
+
+    assert result == [{'name': 'vm-1'}]
+    compiled_jq.input.assert_called_once_with({'host': 'foo'})
+    s_metrics.inc.assert_called_once_with('indirect_node_query_execution_seconds', mock.ANY)
+
+
+@pytest.mark.django_db
+def test_execute_jq_query_error():
+    """Failed jq execution returns None, increments error counter, and records timing."""
+    compiled_jq = mock.MagicMock()
+    compiled_jq.input.return_value.all.side_effect = ValueError('bad input')
+    s_metrics = mock.MagicMock()
+
+    result = _execute_jq_query(compiled_jq, {'host': 'foo'}, 'demo.query.example', 42, s_metrics)
+
+    assert result is None
+    s_metrics.inc.assert_any_call('indirect_node_jq_query_errors', 1)
+    s_metrics.inc.assert_any_call('indirect_node_query_execution_seconds', mock.ANY)
+
+
+@pytest.mark.django_db
+def test_jq_runtime_error_increments_error_metric(bare_job, event_query):
+    """A jq query that errors at runtime should increment the error metric."""
+    create_registered_event(bare_job)
+    s_metrics = mock.MagicMock()
+    query = Query('demo.query.example', TEST_JQ)
+    mock_compiled = mock.MagicMock()
+    mock_compiled.input.return_value.all.side_effect = ValueError('jq runtime error')
+    with mock.patch('jq.compile', return_value=mock_compiled):
+        records = build_indirect_host_data(bare_job, query, s_metrics)
+    assert records == []
+    s_metrics.inc.assert_any_call('indirect_node_jq_query_errors', 1)
+    s_metrics.inc.assert_any_call('indirect_node_query_execution_seconds', mock.ANY)
+
+
+@pytest.mark.django_db
+def test_resolve_event_query_missing_res():
+    """Events without 'res' in event_data return (None, None)."""
+    event = mock.MagicMock()
+    event.event_data = {'resolved_action': 'demo.query.example'}
+    assert _resolve_event_query(event, {}, {}) == (None, None)
+
+
+@pytest.mark.django_db
+def test_resolve_event_query_missing_resolved_action():
+    """Events without 'resolved_action' return (None, None)."""
+    event = mock.MagicMock()
+    event.event_data = {'res': {}}
+    assert _resolve_event_query(event, {}, {}) == (None, None)
+
+
+@pytest.mark.django_db
+def test_process_jq_result_unhashable_facts():
+    """Unhashable canonical_facts should be skipped."""
+    data = {'canonical_facts': {frozenset(): 'bad'}, 'name': 'vm-1'}
+    log_state = {'facts_missing': False, 'unhashable': False, 'name_missing': set()}
+    results = {}
+    event = mock.MagicMock()
+    _process_jq_result(data, 'demo.query.example', event, 'jq_str', mock.MagicMock(), results, log_state)
+    assert results == {}
+    assert log_state['unhashable'] is True
+
+
+@mock.patch('awx.main.tasks.host_indirect.IndirectCountingMetrics')
+@pytest.mark.django_db
+def test_pipe_execute_failure_logs_warning_save(mock_metrics_cls, bare_job, event_query):
+    """Defensive: pipe_execute failure in save_indirect_host_entries logs warning but doesn't raise."""
+    create_registered_event(bare_job)
+    mock_instance = mock.MagicMock()
+    mock_instance.pipe_execute.side_effect = RuntimeError('redis down')
+    mock_metrics_cls.return_value = mock_instance
+
+    save_indirect_host_entries(bare_job.id, wait_for_events=False)
+
+    bare_job.refresh_from_db()
+    assert bare_job.event_queries_processed is True
+
+
+@mock.patch('awx.main.tasks.host_indirect.IndirectCountingMetrics')
+@pytest.mark.django_db
+def test_pipe_execute_failure_logs_warning_fallback(mock_metrics_cls, old_audit_record, new_audit_record):
+    """Defensive: pipe_execute failure in fallback logs warning but doesn't raise."""
+    mock_instance = mock.MagicMock()
+    mock_instance.pipe_execute.side_effect = RuntimeError('redis down')
+    mock_metrics_cls.return_value = mock_instance
+
+    cleanup_and_save_indirect_host_entries_fallback()
+
+    assert IndirectManagedNodeAudit.objects.count() < 2
+
+
+@pytest.mark.django_db
+def test_on_commit_increments_audit_records_metric(bare_job, event_query):
+    """The audit record count metric should fire via on_commit."""
+    create_registered_event(bare_job)
+    s_metrics = mock.MagicMock()
+    callbacks = []
+    with mock.patch('awx.main.tasks.host_indirect.transaction.on_commit', side_effect=lambda fn: callbacks.append(fn)):
+        from awx.main.tasks.host_indirect import save_indirect_host_entries_of_job
+
+        save_indirect_host_entries_of_job(bare_job, s_metrics)
+    assert len(callbacks) == 1
+    callbacks[0]()
+    s_metrics.inc.assert_any_call('indirect_node_audit_records_created', mock.ANY)
+
+
+@pytest.mark.django_db
+def test_job_deleted_between_fetch_and_lock(bare_job):
+    """Race: job exists at initial fetch but is gone by SELECT FOR UPDATE."""
+    job_id = bare_job.id
+    original_atomic = transaction.atomic
+
+    def delete_then_atomic(*args, **kwargs):
+        Job.objects.filter(id=job_id).delete()
+        return original_atomic(*args, **kwargs)
+
+    with mock.patch('awx.main.tasks.host_indirect.transaction.atomic', side_effect=delete_then_atomic):
+        save_indirect_host_entries(job_id, wait_for_events=False)
+
+
+def test_process_jq_result_missing_canonical_facts():
+    """Data without canonical_facts should be skipped and an error logged once; second call skips logging."""
+    data = {'name': 'vm-1'}
+    log_state = {'facts_missing': False, 'unhashable': False, 'name_missing': set()}
+    results = {}
+    event = mock.MagicMock()
+    with mock.patch('awx.main.tasks.host_indirect.logger') as mock_logger:
+        _process_jq_result(data, 'demo.query.example', event, 'jq_str', mock.MagicMock(), results, log_state)
+    assert results == {}
+    assert log_state['facts_missing'] is True
+    mock_logger.error.assert_called_once()
+
+    with mock.patch('awx.main.tasks.host_indirect.logger') as mock_logger2:
+        _process_jq_result(data, 'demo.query.example', event, 'jq_str', mock.MagicMock(), results, log_state)
+    assert results == {}
+    mock_logger2.error.assert_not_called()
+
+
+def test_process_jq_result_unhashable_already_logged():
+    """Second unhashable fact does not log again when already flagged."""
+    data = {'canonical_facts': {frozenset(): 'bad'}, 'name': 'vm-1'}
+    log_state = {'facts_missing': False, 'unhashable': True, 'name_missing': set()}
+    results = {}
+    event = mock.MagicMock()
+    with mock.patch('awx.main.tasks.host_indirect.logger') as mock_logger:
+        _process_jq_result(data, 'demo.query.example', event, 'jq_str', mock.MagicMock(), results, log_state)
+    assert results == {}
+    mock_logger.info.assert_not_called()
+
+
+def test_process_jq_result_null_name_already_logged():
+    """Second null-name event for the same resolved_action does not log again."""
+    data = {'canonical_facts': {'host_name': 'foo'}, 'name': None}
+    log_state = {'facts_missing': False, 'unhashable': False, 'name_missing': {'demo.query.example'}}
+    results = {}
+    event = mock.MagicMock()
+    with mock.patch('awx.main.tasks.host_indirect.logger') as mock_logger:
+        _process_jq_result(data, 'demo.query.example', event, 'jq_str', mock.MagicMock(), results, log_state)
+    assert results == {}
+    mock_logger.warning.assert_not_called()

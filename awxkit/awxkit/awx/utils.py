@@ -3,7 +3,6 @@ from contextlib import contextmanager, suppress
 from awxkit import api, exceptions
 from awxkit.config import config
 
-
 __all__ = ('as_user', 'check_related', 'delete_all', 'uses_sessions')
 
 
@@ -73,7 +72,6 @@ def check_related(resource):
 @contextmanager
 def as_user(v, username, password=None):
     """Context manager to allow running tests as an alternative login user."""
-    access_token = False
     if not isinstance(v, api.client.Connection):
         connection = v.connection
     else:
@@ -83,28 +81,28 @@ def as_user(v, username, password=None):
         password = username.password
         username = username.username
 
-    if isinstance(username, api.OAuth2AccessToken):
-        access_token = username.token
-        username = None
-        password = None
-
     try:
         if config.use_sessions:
             session_id = None
             domain = None
+            cookie_name = connection.session_cookie_name
             # requests doesn't provide interface for retrieving
             # domain segregated cookies other than iterating.
             for cookie in connection.session.cookies:
-                if cookie.name == connection.session_cookie_name:
+                if cookie.name == cookie_name:
                     session_id = cookie.value
                     domain = cookie.domain
                     break
+            if session_id is None and cookie_name != 'gateway_sessionid':
+                for cookie in connection.session.cookies:
+                    if cookie.name == 'gateway_sessionid':
+                        session_id = cookie.value
+                        domain = cookie.domain
+                        cookie_name = 'gateway_sessionid'
+                        break
             if session_id:
-                del connection.session.cookies[connection.session_cookie_name]
-            if access_token:
-                kwargs = dict(token=access_token)
-            else:
-                kwargs = connection.get_session_requirements()
+                del connection.session.cookies[cookie_name]
+            kwargs = connection.get_session_requirements()
         else:
             previous_auth = connection.session.auth
             kwargs = dict()
@@ -112,15 +110,15 @@ def as_user(v, username, password=None):
         yield
     finally:
         if config.use_sessions:
-            if access_token:
-                connection.session.auth = None
-            del connection.session.cookies[connection.session_cookie_name]
+            for name in {connection.session_cookie_name, cookie_name}:
+                with suppress(KeyError):
+                    del connection.session.cookies[name]
             if session_id:
-                connection.session.cookies.set(connection.session_cookie_name, session_id, domain=domain)
+                connection.session.cookies.set(cookie_name, session_id, domain=domain)
         else:
             connection.session.auth = previous_auth
 
 
 def uses_sessions(connection):
-    session_login = connection.get('/api/login/')
+    session_login = connection.get(f"{config.api_base_path}login/")
     return session_login.status_code == 200

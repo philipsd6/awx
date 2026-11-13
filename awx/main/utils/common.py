@@ -6,7 +6,7 @@ from datetime import timedelta
 import json
 import yaml
 import logging
-import time
+import psycopg
 import os
 import subprocess
 import re
@@ -17,13 +17,15 @@ import threading
 import contextlib
 import tempfile
 import functools
+from importlib.metadata import version as _get_version
+from importlib.metadata import entry_points, EntryPoint
 
 # Django
 from django.core.exceptions import ObjectDoesNotExist, FieldDoesNotExist
 from django.utils.dateparse import parse_datetime
 from django.utils.translation import gettext_lazy as _
 from django.utils.functional import cached_property
-from django.db import connection, transaction, ProgrammingError
+from django.db import connection, DatabaseError, transaction, ProgrammingError, IntegrityError
 from django.db.models.fields.related import ForeignObjectRel, ManyToManyField
 from django.db.models.fields.related_descriptors import ForwardManyToOneDescriptor, ManyToManyDescriptor
 from django.db.models.query import QuerySet
@@ -41,6 +43,9 @@ from django.apps import apps
 # AWX
 from awx.conf.license import get_license
 
+# ansible-runner
+from ansible_runner.utils.capacity import get_mem_in_bytes, get_cpu_count
+
 logger = logging.getLogger('awx.main.utils')
 
 __all__ = [
@@ -52,12 +57,10 @@ __all__ = [
     'get_awx_http_client_headers',
     'get_awx_version',
     'update_scm_url',
-    'get_type_for_model',
     'get_model_for_type',
     'copy_model_by_class',
     'copy_m2m_relationships',
     'prefetch_page_capabilities',
-    'to_python_boolean',
     'datetime_hook',
     'ignore_inventory_computed_fields',
     'ignore_inventory_group_removal',
@@ -80,7 +83,6 @@ __all__ = [
     'set_environ',
     'IllegalArgumentError',
     'get_custom_venv_choices',
-    'get_external_account',
     'ScheduleTaskManager',
     'ScheduleDependencyManager',
     'ScheduleWorkflowManager',
@@ -90,7 +92,8 @@ __all__ = [
     'deepmerge',
     'get_event_partition_epoch',
     'cleanup_new_process',
-    'log_excess_runtime',
+    'unified_job_class_to_event_table_name',
+    'get_job_variable_prefixes',
 ]
 
 
@@ -108,18 +111,6 @@ def get_object_or_400(klass, *args, **kwargs):
         raise ParseError(*e.args)
     except queryset.model.MultipleObjectsReturned as e:
         raise ParseError(*e.args)
-
-
-def to_python_boolean(value, allow_none=False):
-    value = str(value)
-    if value.lower() in ('true', '1', 't'):
-        return True
-    elif value.lower() in ('false', '0', 'f'):
-        return False
-    elif allow_none and value.lower() in ('none', 'null'):
-        return None
-    else:
-        raise ValueError(_(u'Unable to convert "%s" to boolean') % value)
 
 
 def datetime_hook(d):
@@ -150,7 +141,7 @@ def underscore_to_camelcase(s):
 @functools.cache
 def is_testing(argv=None):
     '''Return True if running django or py.test unit tests.'''
-    if 'PYTEST_CURRENT_TEST' in os.environ.keys():
+    if os.environ.get('DJANGO_SETTINGS_MODULE') == 'awx.main.tests.settings_for_test':
         return True
     argv = sys.argv if argv is None else argv
     if len(argv) >= 1 and ('py.test' in argv[0] or 'py/test.py' in argv[0]):
@@ -235,9 +226,7 @@ def get_awx_version():
     from awx import __version__
 
     try:
-        import pkg_resources
-
-        return pkg_resources.require('awx')[0].version
+        return _get_version('awx')
     except Exception:
         return __version__
 
@@ -344,16 +333,16 @@ def update_scm_url(scm_type, url, username=True, password=True, check_special_ca
             netloc_password = ''
 
     if netloc_username and parts.scheme != 'file' and scm_type not in ("insights", "archive"):
-        netloc = u':'.join([urllib.parse.quote(x, safe='') for x in (netloc_username, netloc_password) if x])
+        netloc = ':'.join([urllib.parse.quote(x, safe='') for x in (netloc_username, netloc_password) if x])
     else:
-        netloc = u''
+        netloc = ''
     # urllib.parse strips brackets from IPv6 addresses, so we need to add them back in
     hostname = parts.hostname
     if hostname and ':' in hostname and '[' in url and ']' in url:
         hostname = f'[{hostname}]'
-    netloc = u'@'.join(filter(None, [netloc, hostname]))
+    netloc = '@'.join(filter(None, [netloc, hostname]))
     if parts.port:
-        netloc = u':'.join([netloc, str(parts.port)])
+        netloc = ':'.join([netloc, str(parts.port)])
     new_url = urllib.parse.urlunsplit([parts.scheme, netloc, parts.path, parts.query, parts.fragment])
     if scp_format and parts.scheme == 'git+ssh':
         new_url = new_url.replace('git+ssh://', '', 1).replace('/', ':', 1)
@@ -367,7 +356,7 @@ def get_allowed_fields(obj, serializer_mapping):
     else:
         allowed_fields = [x.name for x in obj._meta.fields]
 
-    ACTIVITY_STREAM_FIELD_EXCLUSIONS = {'user': ['last_login'], 'oauth2accesstoken': ['last_used'], 'oauth2application': ['client_secret']}
+    ACTIVITY_STREAM_FIELD_EXCLUSIONS = {'user': ['last_login']}
     model_name = obj._meta.model_name
     fields_excluded = ACTIVITY_STREAM_FIELD_EXCLUSIONS.get(model_name, [])
     # see definition of from_db for CredentialType
@@ -389,7 +378,7 @@ def _convert_model_field_for_display(obj, field_name, password_fields=None):
     if password_fields is None:
         password_fields = set(getattr(type(obj), 'PASSWORD_FIELDS', [])) | set(['password'])
     if field_name in password_fields or (isinstance(field_val, str) and field_val.startswith('$encrypted$')):
-        return u'hidden'
+        return 'hidden'
     if hasattr(obj, 'display_%s' % field_name):
         field_val = getattr(obj, 'display_%s' % field_name)()
     if isinstance(field_val, (list, dict)):
@@ -569,14 +558,6 @@ def copy_m2m_relationships(obj1, obj2, fields, kwargs=None):
                 dest_field.add(*list(src_field_value.all().values_list('id', flat=True)))
 
 
-def get_type_for_model(model):
-    """
-    Return type name for a given model class.
-    """
-    opts = model._meta.concrete_model._meta
-    return camelcase_to_underscore(opts.object_name)
-
-
 def get_model_for_type(type_name):
     """
     Return model class for a given type name.
@@ -611,18 +592,18 @@ def prefetch_page_capabilities(model, page, prefetch_list, user):
         4: {'edit': True, 'start': True},
         6: {'edit': False, 'start': False}
     }
-    Each capability is produced for all items in the page in a single query
+    Each capability is produced for all items in the page in a single query.
 
-    Examples of prefetch language:
-    prefetch_list = ['admin', 'execute']
-      --> prefetch the admin (edit) and execute (start) permissions for
+    Examples of prefetch language (permission-based):
+    prefetch_list = [{'edit': 'change'}, {'start': 'execute'}]
+      --> prefetch change (edit) and execute (start) permissions for
           items in list for current user
-    prefetch_list = ['inventory.admin']
-      --> prefetch the related inventory FK permissions for current user,
+    prefetch_list = [{'edit': 'inventory.change'}]
+      --> prefetch related inventory FK change permissions for current user,
           and put it into the object's cache
-    prefetch_list = [{'copy': ['inventory.admin', 'project.admin']}]
-      --> prefetch logical combination of admin permission to inventory AND
-          project, put into cache dictionary as "copy"
+    prefetch_list = [{'copy': ['inventory.use', 'project.use']}]
+      --> prefetch logical combination of use permission to inventory AND
+          project, put into cache dictionary as 'copy'
     """
     page_ids = [obj.id for obj in page]
     mapping = {}
@@ -640,29 +621,28 @@ def prefetch_page_capabilities(model, page, prefetch_list, user):
         if type(paths) is not list:
             paths = [paths]
 
-        # Build the query for accessible_objects according the user & role(s)
+        # Build the query for access_qs according the user & permission(s)
         filter_args = []
-        for role_path in paths:
-            if '.' in role_path:
-                res_path = '__'.join(role_path.split('.')[:-1])
-                role_type = role_path.split('.')[-1]
+        for perm_path in paths:
+            if '.' in perm_path:
+                res_path = '__'.join(perm_path.split('.')[:-1])
+                action = perm_path.split('.')[-1]
                 parent_model = model
-                for subpath in role_path.split('.')[:-1]:
+                for subpath in perm_path.split('.')[:-1]:
                     parent_model = parent_model._meta.get_field(subpath).related_model
-                filter_args.append(
-                    Q(Q(**{'%s__pk__in' % res_path: parent_model.accessible_pk_qs(user, '%s_role' % role_type)}) | Q(**{'%s__isnull' % res_path: True}))
-                )
+                access_qs = parent_model.access_qs(user, action)
+                filter_args.append(Q(Q(**{'%s__in' % res_path: access_qs}) | Q(**{'%s__isnull' % res_path: True})))
             else:
-                role_type = role_path
-                filter_args.append(Q(**{'pk__in': model.accessible_pk_qs(user, '%s_role' % role_type)}))
+                action = perm_path
+                if hasattr(model, 'access_qs'):
+                    filter_args.append(Q(**{'pk__in': model.access_qs(user, action)}))
+                else:
+                    # UnifiedJobTemplate is not registered with the permission registry,
+                    # so it only has access_ids_qs (not access_qs)
+                    filter_args.append(Q(**{'pk__in': model.access_ids_qs(user, action)}))
 
         if display_method is None:
-            # Role name translation to UI names for methods
-            display_method = role_type
-            if role_type == 'admin':
-                display_method = 'edit'
-            elif role_type in ['execute', 'update']:
-                display_method = 'start'
+            display_method = action
 
         # Union that query with the list of items on page
         filter_args.append(Q(pk__in=page_ids))
@@ -717,7 +697,7 @@ def parse_yaml_or_json(vars_str, silent_failure=True):
             if silent_failure:
                 return {}
             raise ParseError(
-                _('Cannot parse as JSON (error: {json_error}) or ' 'YAML (error: {yaml_error}).').format(json_error=str(json_err), yaml_error=str(yaml_err))
+                _('Cannot parse as JSON (error: {json_error}) or YAML (error: {yaml_error}).').format(json_error=str(json_err), yaml_error=str(yaml_err))
             )
     return vars_dict
 
@@ -768,14 +748,13 @@ def get_corrected_cpu(cpu_count):  # formerlly get_cpu_capacity
     return cpu_count  # no correction
 
 
-def get_cpu_effective_capacity(cpu_count):
+def get_cpu_effective_capacity(cpu_count, is_control_node=False):
     from django.conf import settings
-
-    cpu_count = get_corrected_cpu(cpu_count)
 
     settings_forkcpu = getattr(settings, 'SYSTEM_TASK_FORKS_CPU', None)
     env_forkcpu = os.getenv('SYSTEM_TASK_FORKS_CPU', None)
-
+    if is_control_node:
+        cpu_count = get_corrected_cpu(cpu_count)
     if env_forkcpu:
         forkcpu = int(env_forkcpu)
     elif settings_forkcpu:
@@ -784,6 +763,21 @@ def get_cpu_effective_capacity(cpu_count):
         forkcpu = 4
 
     return max(1, int(cpu_count * forkcpu))
+
+
+def get_job_variable_prefixes():
+    """Return the list of active job variable prefixes based on INCLUDE_DEPRECATED_AWX_VAR_PREFIX setting.
+
+    When True (default), returns both 'awx' and 'tower' prefixes for backward compatibility.
+    When False, returns only 'tower'. The 'awx' prefix is deprecated and this setting
+    will default to False in a future release.
+    """
+    from django.conf import settings
+
+    include_awx = getattr(settings, 'INCLUDE_DEPRECATED_AWX_VAR_PREFIX', True)
+    if include_awx:
+        return ['awx', 'tower']
+    return ['tower']
 
 
 def convert_mem_str_to_bytes(mem_str):
@@ -834,6 +828,7 @@ def get_corrected_memory(memory):
 
     # Runner returns memory in bytes
     # so we convert memory from settings to bytes as well.
+
     if env_absmem is not None:
         return convert_mem_str_to_bytes(env_absmem)
     elif settings_absmem is not None:
@@ -842,14 +837,13 @@ def get_corrected_memory(memory):
     return memory
 
 
-def get_mem_effective_capacity(mem_bytes):
+def get_mem_effective_capacity(mem_bytes, is_control_node=False):
     from django.conf import settings
-
-    mem_bytes = get_corrected_memory(mem_bytes)
 
     settings_mem_mb_per_fork = getattr(settings, 'SYSTEM_TASK_FORKS_MEM', None)
     env_mem_mb_per_fork = os.getenv('SYSTEM_TASK_FORKS_MEM', None)
-
+    if is_control_node:
+        mem_bytes = get_corrected_memory(mem_bytes)
     if env_mem_mb_per_fork:
         mem_mb_per_fork = int(env_mem_mb_per_fork)
     elif settings_mem_mb_per_fork:
@@ -1013,9 +1007,15 @@ def getattrd(obj, name, default=NoDefaultProvided):
         raise
 
 
-def getattr_dne(obj, name, notfound=ObjectDoesNotExist):
+empty = object()
+
+
+def getattr_dne(obj, name, default=empty, notfound=ObjectDoesNotExist):
     try:
-        return getattr(obj, name)
+        if default is empty:
+            return getattr(obj, name)
+        else:
+            return getattr(obj, name, default)
     except notfound:
         return None
 
@@ -1089,29 +1089,6 @@ def has_model_field_prefetched(model_obj, field_name):
     return getattr(getattr(model_obj, field_name, None), 'prefetch_cache_name', '') in getattr(model_obj, '_prefetched_objects_cache', {})
 
 
-def get_external_account(user):
-    from django.conf import settings
-
-    account_type = None
-    if getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
-        try:
-            if user.pk and user.profile.ldap_dn and not user.has_usable_password():
-                account_type = "ldap"
-        except AttributeError:
-            pass
-    if (
-        getattr(settings, 'SOCIAL_AUTH_GOOGLE_OAUTH2_KEY', None)
-        or getattr(settings, 'SOCIAL_AUTH_GITHUB_KEY', None)
-        or getattr(settings, 'SOCIAL_AUTH_GITHUB_ORG_KEY', None)
-        or getattr(settings, 'SOCIAL_AUTH_GITHUB_TEAM_KEY', None)
-        or getattr(settings, 'SOCIAL_AUTH_SAML_ENABLED_IDPS', None)
-    ) and user.social_auth.all():
-        account_type = "social"
-    if (getattr(settings, 'RADIUS_SERVER', None) or getattr(settings, 'TACACSPLUS_HOST', None)) and user.enterprise_auth.all():
-        account_type = "enterprise"
-    return account_type
-
-
 class classproperty:
     def __init__(self, fget=None, fset=None, fdel=None, doc=None):
         self.fget = fget
@@ -1134,7 +1111,11 @@ def create_temporary_fifo(data):
     path = os.path.join(tempfile.mkdtemp(), next(tempfile._get_candidate_names()))
     os.mkfifo(path, stat.S_IRUSR | stat.S_IWUSR)
 
-    threading.Thread(target=lambda p, d: open(p, 'wb').write(d), args=(path, data)).start()
+    def tmp_write(path, data):
+        with open(path, 'wb') as f:
+            f.write(data)
+
+    threading.Thread(target=tmp_write, args=(path, data)).start()
     return path
 
 
@@ -1144,15 +1125,15 @@ def truncate_stdout(stdout, size):
     if size <= 0 or len(stdout) <= size:
         return stdout
 
-    stdout = stdout[: (size - 1)] + u'\u2026'
+    stdout = stdout[: (size - 1)] + '\u2026'
     set_count, reset_count = 0, 0
     for m in ANSI_SGR_PATTERN.finditer(stdout):
-        if m.group() == u'\u001b[0m':
+        if m.group() == '\u001b[0m':
             reset_count += 1
         else:
             set_count += 1
 
-    return stdout + u'\u001b[0m' * (set_count - reset_count)
+    return stdout + '\u001b[0m' * (set_count - reset_count)
 
 
 def deepmerge(a, b):
@@ -1172,6 +1153,17 @@ def deepmerge(a, b):
         return b
 
 
+def table_exists(cursor, table_name):
+    cursor.execute(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table_name}');")
+    row = cursor.fetchone()
+    if row is not None:
+        for val in row:  # should only have 1
+            if val is True:
+                logger.debug(f'Event partition table {table_name} already exists')
+                return True
+    return False
+
+
 def create_partition(tblname, start=None):
     """Creates new partition table for events.  By default it covers the current hour."""
     if start is None:
@@ -1188,13 +1180,37 @@ def create_partition(tblname, start=None):
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
+                if table_exists(cursor, f"{tblname}_{partition_label}"):
+                    return
+
                 cursor.execute(
-                    f'CREATE TABLE IF NOT EXISTS {tblname}_{partition_label} '
-                    f'PARTITION OF {tblname} '
-                    f'FOR VALUES FROM (\'{start_timestamp}\') to (\'{end_timestamp}\');'
+                    f'CREATE TABLE {tblname}_{partition_label} (LIKE {tblname} INCLUDING DEFAULTS INCLUDING CONSTRAINTS); '
+                    f'ALTER TABLE {tblname} ATTACH PARTITION {tblname}_{partition_label} '
+                    f'FOR VALUES FROM (\'{start_timestamp}\') TO (\'{end_timestamp}\');'
                 )
-    except ProgrammingError as e:
-        logger.debug(f'Caught known error due to existing partition: {e}')
+
+    except (ProgrammingError, IntegrityError) as e:
+        cause = e.__cause__
+        if cause and hasattr(cause, 'sqlstate'):
+            sqlstate = cause.sqlstate
+            if sqlstate is None:
+                raise
+            sqlstate_cls = psycopg.errors.lookup(sqlstate)
+
+            if sqlstate_cls in (psycopg.errors.DuplicateTable, psycopg.errors.DuplicateObject, psycopg.errors.UniqueViolation):
+                logger.info(f'Caught known error due to partition creation race: {e}')
+            else:
+                logger.error('SQL Error state: {} - {}'.format(sqlstate, sqlstate_cls))
+                raise
+    except DatabaseError as e:
+        cause = e.__cause__
+        if cause and hasattr(cause, 'sqlstate'):
+            sqlstate = cause.sqlstate
+            if sqlstate is None:
+                raise
+            sqlstate_str = psycopg.errors.lookup(sqlstate)
+            logger.error('SQL Error state: {} - {}'.format(sqlstate, sqlstate_str))
+        raise
 
 
 def cleanup_new_process(func):
@@ -1214,32 +1230,44 @@ def cleanup_new_process(func):
     return wrapper_cleanup_new_process
 
 
-def log_excess_runtime(func_logger, cutoff=5.0, debug_cutoff=5.0, msg=None, add_log_data=False):
-    def log_excess_runtime_decorator(func):
-        @functools.wraps(func)
-        def _new_func(*args, **kwargs):
-            start_time = time.time()
-            log_data = {'name': repr(func.__name__)}
+def unified_job_class_to_event_table_name(job_class):
+    return f'main_{job_class().event_class.__name__.lower()}'
 
-            if add_log_data:
-                return_value = func(*args, log_data=log_data, **kwargs)
-            else:
-                return_value = func(*args, **kwargs)
 
-            log_data['delta'] = time.time() - start_time
-            if isinstance(return_value, dict):
-                log_data.update(return_value)
+def load_all_entry_points_for(entry_point_subsections: list[str], /) -> dict[str, EntryPoint]:
+    return {ep.name: ep for entry_point_category in entry_point_subsections for ep in entry_points(group=f'awx_plugins.{entry_point_category}')}
 
-            if msg is None:
-                record_msg = 'Running {name} took {delta:.2f}s'
-            else:
-                record_msg = msg
-            if log_data['delta'] > cutoff:
-                func_logger.info(record_msg.format(**log_data))
-            elif log_data['delta'] > debug_cutoff:
-                func_logger.debug(record_msg.format(**log_data))
-            return return_value
 
-        return _new_func
+def get_auto_max_workers():
+    """Method we normally rely on to get max_workers
 
-    return log_excess_runtime_decorator
+    Uses almost same logic as Instance.local_health_check
+    The important thing is to be MORE than Instance.capacity
+    so that the task-manager does not over-schedule this node
+
+    Ideally we would just use the capacity from the database plus reserve workers,
+    but this poses some bootstrap problems where OCP task containers
+    register themselves after startup
+    """
+    # Get memory from ansible-runner
+    total_memory_gb = get_mem_in_bytes()
+
+    # This may replace memory calculation with a user override
+    corrected_memory = get_corrected_memory(total_memory_gb)
+
+    # Get same number as max forks based on memory, this function takes memory as bytes
+    mem_capacity = get_mem_effective_capacity(corrected_memory, is_control_node=True)
+
+    # Follow same process for CPU capacity constraint
+    cpu_count = get_cpu_count()
+    corrected_cpu = get_corrected_cpu(cpu_count)
+    cpu_capacity = get_cpu_effective_capacity(corrected_cpu, is_control_node=True)
+
+    # Here is what is different from health checks,
+    auto_max = max(mem_capacity, cpu_capacity)
+
+    # add magic number of extra workers to ensure
+    # we have a few extra workers to run the heartbeat
+    auto_max += 7
+
+    return auto_max

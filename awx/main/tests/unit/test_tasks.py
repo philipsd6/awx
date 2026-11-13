@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-import configparser
 import json
 import os
-import shutil
-import tempfile
+import tarfile
 from pathlib import Path
 
 import fcntl
 from unittest import mock
 import pytest
 import yaml
-import jinja2
+
+from awx_plugins.interfaces._temporary_private_container_api import CONTAINER_ROOT
 
 from django.conf import settings
 
@@ -33,14 +32,14 @@ from awx.main.models import (
     build_safe_env,
 )
 from awx.main.models.credential import HIDDEN_PASSWORD, ManagedCredentialType
+from awx.main.redact import UriCleaner
 
 from awx.main.tasks import jobs, system, receptor
 from awx.main.utils import encrypt_field, encrypt_value
 from awx.main.utils.safe_yaml import SafeLoader
-from awx.main.utils.execution_environments import CONTAINER_ROOT
 
 from awx.main.utils.licensing import Licenser
-from awx.main.constants import JOB_VARIABLE_PREFIXES
+from awx.main.utils.common import get_job_variable_prefixes
 
 from receptorctl.socket_interface import ReceptorControl
 
@@ -61,14 +60,12 @@ class TestJobExecution(object):
 
 
 @pytest.fixture
-def private_data_dir():
-    private_data = tempfile.mkdtemp(prefix='awx_')
+def private_data_dir(tmp_path):
+    private_data = tmp_path / 'awx_pdd'
+    private_data.mkdir()
     for subfolder in ('inventory', 'env'):
-        runner_subfolder = os.path.join(private_data, subfolder)
-        if not os.path.exists(runner_subfolder):
-            os.mkdir(runner_subfolder)
-    yield private_data
-    shutil.rmtree(private_data, True)
+        (private_data / subfolder).mkdir()
+    return str(private_data)
 
 
 @pytest.fixture
@@ -108,7 +105,7 @@ def job():
 
 @pytest.fixture
 def adhoc_job():
-    return AdHocCommand(pk=1, id=1, inventory=Inventory())
+    return AdHocCommand(pk=1, id=1, inventory=Inventory(), status='waiting')
 
 
 @pytest.fixture
@@ -137,17 +134,10 @@ def test_send_notifications_not_list():
 
 
 def test_send_notifications_job_id(mocker):
-    with mocker.patch('awx.main.models.UnifiedJob.objects.get'):
-        system.send_notifications([], job_id=1)
-        assert UnifiedJob.objects.get.called
-        assert UnifiedJob.objects.get.called_with(id=1)
-
-
-def test_work_success_callback_missing_job():
-    task_data = {'type': 'project_update', 'id': 9999}
-    with mock.patch('django.db.models.query.QuerySet.get') as get_mock:
-        get_mock.side_effect = ProjectUpdate.DoesNotExist()
-        assert system.handle_work_success(task_data) is None
+    mocker.patch('awx.main.models.UnifiedJob.objects.get')
+    system.send_notifications([], job_id=1)
+    assert UnifiedJob.objects.get.called
+    UnifiedJob.objects.get.assert_called_with(id=1)
 
 
 @mock.patch('awx.main.models.UnifiedJob.objects.get')
@@ -164,7 +154,7 @@ def test_send_notifications_list(mock_notifications_filter, mock_job_get, mocker
     assert mock_notifications[0].save.called
 
     assert mock_job.notifications.add.called
-    assert mock_job.notifications.add.called_with(*mock_notifications)
+    mock_job.notifications.add.assert_called_with(*mock_notifications)
 
 
 @pytest.mark.parametrize(
@@ -371,7 +361,7 @@ class TestExtraVarSanitation(TestJobExecution):
     # are deemed trustable, because they can only be added by users w/ enough
     # privilege to add/modify a Job Template)
 
-    UNSAFE = '{{ lookup(' 'pipe' ',' 'ls -la' ') }}'
+    UNSAFE = "{{ lookup('pipe', 'ls -la') }}"
 
     def test_vars_unsafe_by_default(self, job, private_data_dir, mock_me):
         job.created_by = User(pk=123, username='angry-spud')
@@ -380,16 +370,16 @@ class TestExtraVarSanitation(TestJobExecution):
         task = jobs.RunJob()
         task.build_extra_vars_file(job, private_data_dir)
 
-        fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, Loader=SafeLoader)
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
 
         # ensure that strings are marked as unsafe
-        for name in JOB_VARIABLE_PREFIXES:
+        for name in get_job_variable_prefixes():
             for variable_name in ['_job_template_name', '_user_name', '_job_launch_type', '_project_revision', '_inventory_name']:
                 assert hasattr(extra_vars['{}{}'.format(name, variable_name)], '__UNSAFE__')
 
         # ensure that non-strings are marked as safe
-        for name in JOB_VARIABLE_PREFIXES:
+        for name in get_job_variable_prefixes():
             for variable_name in ['_job_template_id', '_job_id', '_user_id', '_inventory_id']:
                 assert not hasattr(extra_vars['{}{}'.format(name, variable_name)], '__UNSAFE__')
 
@@ -399,8 +389,8 @@ class TestExtraVarSanitation(TestJobExecution):
 
         task.build_extra_vars_file(job, private_data_dir)
 
-        fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, Loader=SafeLoader)
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == self.UNSAFE
         assert hasattr(extra_vars['msg'], '__UNSAFE__')
 
@@ -410,8 +400,8 @@ class TestExtraVarSanitation(TestJobExecution):
 
         task.build_extra_vars_file(job, private_data_dir)
 
-        fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, Loader=SafeLoader)
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == {'a': [self.UNSAFE]}
         assert hasattr(extra_vars['msg']['a'][0], '__UNSAFE__')
 
@@ -421,8 +411,8 @@ class TestExtraVarSanitation(TestJobExecution):
 
         task.build_extra_vars_file(job, private_data_dir)
 
-        fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, Loader=SafeLoader)
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == self.UNSAFE
         assert not hasattr(extra_vars['msg'], '__UNSAFE__')
 
@@ -433,8 +423,8 @@ class TestExtraVarSanitation(TestJobExecution):
 
         task.build_extra_vars_file(job, private_data_dir)
 
-        fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, Loader=SafeLoader)
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == {'a': {'b': [self.UNSAFE]}}
         assert not hasattr(extra_vars['msg']['a']['b'][0], '__UNSAFE__')
 
@@ -447,8 +437,8 @@ class TestExtraVarSanitation(TestJobExecution):
 
         task.build_extra_vars_file(job, private_data_dir)
 
-        fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, Loader=SafeLoader)
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == 'other-value'
         assert hasattr(extra_vars['msg'], '__UNSAFE__')
 
@@ -462,13 +452,14 @@ class TestExtraVarSanitation(TestJobExecution):
 
         task.build_extra_vars_file(job, private_data_dir)
 
-        fd = open(os.path.join(private_data_dir, 'env', 'extravars'))
-        extra_vars = yaml.load(fd, Loader=SafeLoader)
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
         assert extra_vars['msg'] == self.UNSAFE
         assert hasattr(extra_vars['msg'], '__UNSAFE__')
 
 
 class TestGenericRun:
+    @pytest.mark.django_db(reset_sequences=True)
     def test_generic_failure(self, patch_Job, execution_environment, mock_me, mock_create_partition):
         job = Job(status='running', inventory=Inventory(), project=Project(local_path='/projects/_23_foo'))
         job.websocket_emit_status = mock.Mock()
@@ -480,34 +471,15 @@ class TestGenericRun:
         task.model.objects.get = mock.Mock(return_value=job)
         task.build_private_data_files = mock.Mock(side_effect=OSError())
 
-        with mock.patch('awx.main.tasks.jobs.shutil.copytree'):
-            with pytest.raises(Exception):
-                task.run(1)
+        with mock.patch('awx.main.tasks.jobs.update_model', return_value=job) as mock_update_model:
+            with mock.patch('awx.main.tasks.jobs.shutil.copytree'), mock.patch('awx.main.tasks.jobs.evaluate_policy'):
+                with pytest.raises(Exception):
+                    task.run(1)
 
-        update_model_call = task.update_model.call_args[1]
+        update_model_call = mock_update_model.call_args[1]
         assert 'OSError' in update_model_call['result_traceback']
         assert update_model_call['status'] == 'error'
         assert update_model_call['emitted_events'] == 0
-
-    def test_cancel_flag(self, job, update_model_wrapper, execution_environment, mock_me, mock_create_partition):
-        job.status = 'running'
-        job.cancel_flag = True
-        job.websocket_emit_status = mock.Mock()
-        job.send_notification_templates = mock.Mock()
-        job.execution_environment = execution_environment
-
-        task = jobs.RunJob()
-        task.instance = job
-        task.update_model = mock.Mock(wraps=update_model_wrapper)
-        task.model.objects.get = mock.Mock(return_value=job)
-        task.build_private_data_files = mock.Mock()
-
-        with mock.patch('awx.main.tasks.jobs.shutil.copytree'):
-            with pytest.raises(Exception):
-                task.run(1)
-
-        for c in [mock.call(1, start_args='', status='canceled')]:
-            assert c in task.update_model.call_args_list
 
     def test_event_count(self, mock_me):
         task = jobs.RunJob()
@@ -555,7 +527,7 @@ class TestGenericRun:
         call_args, _ = task._write_extra_vars_file.call_args_list[0]
 
         private_data_dir, extra_vars, safe_dict = call_args
-        for name in JOB_VARIABLE_PREFIXES:
+        for name in get_job_variable_prefixes():
             assert extra_vars['{}_user_id'.format(name)] == 123
             assert extra_vars['{}_user_name'.format(name)] == "angry-spud"
 
@@ -573,6 +545,7 @@ class TestGenericRun:
         private_data_dir, extra_vars, safe_dict = call_args
         assert extra_vars['super_secret'] == "CLASSIFIED"
 
+    @pytest.mark.django_db
     def test_awx_task_env(self, patch_Job, private_data_dir, execution_environment, mock_me):
         job = Job(project=Project(), inventory=Inventory())
         job.execution_environment = execution_environment
@@ -582,8 +555,167 @@ class TestGenericRun:
         task._write_extra_vars_file = mock.Mock()
 
         with mock.patch('awx.main.tasks.jobs.settings.AWX_TASK_ENV', {'FOO': 'BAR'}):
-            env = task.build_env(job, private_data_dir)
+            with mock.patch.object(task, 'build_credentials_list', return_value=[], autospec=True):
+                env = task.build_env(job, private_data_dir)
         assert env['FOO'] == 'BAR'
+
+    @pytest.mark.parametrize(
+        'value,expected',
+        [
+            ('True', True),
+            ('true', True),
+            ('1', True),
+            ('yes', True),
+            ('on', True),
+            ('y', True),
+            ('t', True),
+            ('False', False),
+            ('0', False),
+            ('', False),
+        ],
+    )
+    def test_env_flag_enabled(self, value, expected):
+        """Truthy spellings match strtobool; other strings are False."""
+        assert jobs.env_flag_enabled({'RUNNER_OMIT_EVENTS': value}, 'RUNNER_OMIT_EVENTS') is expected
+
+    def test_env_flag_enabled_missing_key(self):
+        """A missing or unrelated key is False, not an error."""
+        assert jobs.env_flag_enabled({}, 'RUNNER_OMIT_EVENTS') is False
+        assert jobs.env_flag_enabled({'RUNNER_ONLY_FAILED_EVENTS': 'True'}, 'RUNNER_OMIT_EVENTS') is False
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        'task_env,omit_expected,only_failed_expected',
+        [
+            ({'RUNNER_OMIT_EVENTS': 'True', 'RUNNER_ONLY_FAILED_EVENTS': 'yes'}, True, True),
+            ({'RUNNER_OMIT_EVENTS': 'False', 'RUNNER_ONLY_FAILED_EVENTS': '0'}, False, False),
+            ({}, False, False),
+        ],
+    )
+    def test_run_passes_omit_event_flags_to_receptor(
+        self, patch_Job, execution_environment, mock_me, mock_create_partition, private_data_dir, task_env, omit_expected, only_failed_expected
+    ):
+        """AWX_TASK_ENV runner flags must be forwarded as ansible-runner constructor params."""
+        job = Job(pk=1, id=1, status='running', inventory=Inventory(), project=Project(local_path='/projects/_23_foo'), playbook='site.yml')
+        job.websocket_emit_status = mock.Mock()
+        job.send_notification_templates = mock.Mock()
+        job.log_lifecycle = mock.Mock()
+        job.execution_environment = execution_environment
+        job.resolve_execution_environment = mock.Mock(return_value=execution_environment)
+        job.cancel_flag = False
+
+        task = jobs.RunJob()
+        task.instance = job
+        task.update_model = mock.Mock(return_value=job)
+        task.build_private_data_dir = mock.Mock(return_value=private_data_dir)
+        task.build_project_dir = mock.Mock()
+        task.build_extra_vars_file = mock.Mock()
+        task.build_inventory = mock.Mock(return_value=os.path.join(private_data_dir, 'inventory', 'hosts'))
+        task.post_run_hook = mock.Mock()
+
+        receptor_job = mock.Mock()
+        receptor_job.run.return_value = mock.Mock(status='successful', rc=0)
+        receptor_job.unit_id = 'wu-1'
+        receptor_job.receptor_ctl = None
+
+        with (
+            mock.patch('awx.main.tasks.jobs.settings.AWX_TASK_ENV', task_env),
+            mock.patch('awx.main.tasks.jobs.settings.AWX_ISOLATION_BASE_PATH', private_data_dir),
+            mock.patch('awx.main.tasks.jobs.evaluate_policy'),
+            mock.patch('awx.main.tasks.jobs.flag_enabled', return_value=False),
+            mock.patch('awx.main.tasks.jobs.AWXReceptorJob', return_value=receptor_job) as mock_receptor_cls,
+            mock.patch('awx.main.tasks.jobs._finalize_job_run', return_value=job),
+            mock.patch.object(task, 'build_credentials_list', return_value=[]),
+            mock.patch.object(task.model.objects, 'get', return_value=job),
+        ):
+            task.run(1)
+
+        mock_receptor_cls.assert_called_once()
+        params = mock_receptor_cls.call_args[0][1]
+        assert params['omit_event_data'] is omit_expected
+        assert params['only_failed_event_data'] is only_failed_expected
+        for key, value in task_env.items():
+            assert params['envvars'][key] == value
+
+    @pytest.mark.django_db
+    @pytest.mark.usefixtures('patch_Organization')
+    @pytest.mark.parametrize(
+        'task_env',
+        [
+            {'RUNNER_OMIT_EVENTS': 'True'},
+            {'RUNNER_ONLY_FAILED_EVENTS': 'True'},
+            {'RUNNER_OMIT_EVENTS': 'True', 'RUNNER_ONLY_FAILED_EVENTS': 'yes'},
+        ],
+    )
+    def test_run_keeps_omit_event_flags_disabled_for_project_update(self, execution_environment, mock_me, mock_create_partition, private_data_dir, task_env):
+        """Project updates keep event metadata even when global omission flags are enabled."""
+        project_update = ProjectUpdate(pk=1, id=1, status='running', project=Project(pk=1, organization=Organization(pk=1)))
+        project_update.websocket_emit_status = mock.Mock()
+        project_update.send_notification_templates = mock.Mock()
+        project_update.log_lifecycle = mock.Mock()
+        project_update.execution_environment = execution_environment
+        project_update.resolve_execution_environment = mock.Mock(return_value=execution_environment)
+        project_update.cancel_flag = False
+        project_update.scm_type = 'git'
+
+        task = jobs.RunProjectUpdate()
+        task.instance = project_update
+        task.update_model = mock.Mock(return_value=project_update)
+        task.build_private_data_dir = mock.Mock(return_value=private_data_dir)
+        task.build_project_dir = mock.Mock()
+        task.build_extra_vars_file = mock.Mock()
+        task.build_private_data_files = mock.Mock(return_value=({}, None))
+        task.pre_run_hook = mock.Mock()
+        task.post_run_hook = mock.Mock()
+
+        receptor_job = mock.Mock()
+        receptor_job.run.return_value = mock.Mock(status='successful', rc=0)
+        receptor_job.unit_id = 'wu-1'
+        receptor_job.receptor_ctl = None
+
+        with (
+            mock.patch('awx.main.tasks.jobs.settings.AWX_TASK_ENV', task_env),
+            mock.patch('awx.main.tasks.jobs.settings.AWX_ISOLATION_BASE_PATH', private_data_dir),
+            mock.patch('awx.main.tasks.jobs.evaluate_policy'),
+            mock.patch('awx.main.tasks.jobs.flag_enabled', return_value=False),
+            mock.patch('awx.main.tasks.jobs.AWXReceptorJob', return_value=receptor_job) as mock_receptor_cls,
+            mock.patch('awx.main.tasks.jobs._finalize_job_run', return_value=project_update),
+            mock.patch.object(task, 'build_credentials_list', return_value=[]),
+            mock.patch.object(task.model.objects, 'get', return_value=project_update),
+        ):
+            task.run(1)
+
+        mock_receptor_cls.assert_called_once()
+        params = mock_receptor_cls.call_args[0][1]
+        assert params['omit_event_data'] is False
+        assert params['only_failed_event_data'] is False
+        for key, value in task_env.items():
+            assert params['envvars'][key] == value
+
+        # Flags stay off so the project-update callback still sees task_action / scm_version.
+        task.runner_callback.dispatcher = mock.Mock()
+        task.runner_callback.event_data_key = 'project_update_id'
+        task.runner_callback.wrapup_event_type = 'playbook_on_stats'
+        scm_url = 'https://scmuser:scmpass@git.example.com/org/repo.git'
+        task.runner_callback.event_handler(
+            {
+                'event': 'runner_on_failed',
+                'stdout': f'failed: {scm_url}',
+                'event_data': {'task_action': 'git', 'res': {'msg': f'Failed to clone {scm_url}'}},
+            }
+        )
+        dispatched = json.dumps(task.runner_callback.dispatcher.dispatch.call_args[0][0])
+        assert 'scmuser' not in dispatched
+        assert 'scmpass' not in dispatched
+        assert UriCleaner.REPLACE_STR in dispatched
+
+        task.runner_callback.event_handler(
+            {
+                'event': 'runner_on_ok',
+                'event_data': {'task_action': 'set_fact', 'res': {'ansible_facts': {'scm_version': 'abc123def'}}},
+            }
+        )
+        assert task.runner_callback.playbook_new_revision == 'abc123def'
 
 
 @pytest.mark.django_db
@@ -597,15 +729,18 @@ class TestAdhocRun(TestJobExecution):
         adhoc_job.send_notification_templates = mock.Mock()
 
         task = jobs.RunAdHocCommand()
+        adhoc_job.status = 'running'  # to bypass status flip
+        task.instance = adhoc_job  # to bypass fetch
         task.update_model = mock.Mock(wraps=adhoc_update_model_wrapper)
         task.model.objects.get = mock.Mock(return_value=adhoc_job)
         task.build_inventory = mock.Mock()
 
-        with pytest.raises(Exception):
-            task.run(adhoc_job.pk)
+        with mock.patch('awx.main.tasks.jobs.update_model', return_value=adhoc_job) as mock_update_model:
+            with pytest.raises(Exception):
+                task.run(adhoc_job.pk)
 
         call_args, _ = task.update_model.call_args_list[0]
-        update_model_call = task.update_model.call_args[1]
+        update_model_call = mock_update_model.call_args[1]
         assert 'Jinja variables are not allowed' in update_model_call['result_traceback']
 
     '''
@@ -642,12 +777,17 @@ class TestAdhocRun(TestJobExecution):
         call_args, _ = task._write_extra_vars_file.call_args_list[0]
 
         private_data_dir, extra_vars = call_args
-        for name in JOB_VARIABLE_PREFIXES:
+        for name in get_job_variable_prefixes():
             assert extra_vars['{}_user_id'.format(name)] == 123
             assert extra_vars['{}_user_name'.format(name)] == "angry-spud"
 
 
 class TestJobCredentials(TestJobExecution):
+    @pytest.fixture(autouse=True)
+    def mock_flag_enabled(self):
+        with mock.patch('awx.main.tasks.jobs.flag_enabled', return_value=False):
+            yield
+
     @pytest.fixture
     def job(self, execution_environment):
         job = Job(pk=1, inventory=Inventory(pk=1), project=Project(pk=1))
@@ -673,7 +813,9 @@ class TestJobCredentials(TestJobExecution):
         )
 
         with mock.patch.object(UnifiedJob, 'credentials', credentials_mock):
-            yield job
+            # Mock build_credentials_list to work with the cached credentials mechanism
+            with mock.patch.object(jobs.RunJob, 'build_credentials_list', return_value=job._credentials, autospec=True):
+                yield job
 
     @pytest.fixture
     def update_model_wrapper(self, job):
@@ -863,202 +1005,6 @@ class TestJobCredentials(TestJobExecution):
         assert '--vault-id dev@prompt' in ' '.join(args)
         assert '--vault-id prod@prompt' in ' '.join(args)
 
-    @pytest.mark.parametrize("verify", (True, False))
-    def test_k8s_credential(self, job, private_data_dir, verify, mock_me):
-        k8s = CredentialType.defaults['kubernetes_bearer_token']()
-        inputs = {
-            'host': 'https://example.org/',
-            'bearer_token': 'token123',
-        }
-        if verify:
-            inputs['verify_ssl'] = True
-            inputs['ssl_ca_cert'] = 'CERTDATA'
-        credential = Credential(
-            pk=1,
-            credential_type=k8s,
-            inputs=inputs,
-        )
-        credential.inputs['bearer_token'] = encrypt_field(credential, 'bearer_token')
-        job.credentials.add(credential)
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-
-        assert env['K8S_AUTH_HOST'] == 'https://example.org/'
-        assert env['K8S_AUTH_API_KEY'] == 'token123'
-
-        if verify:
-            assert env['K8S_AUTH_VERIFY_SSL'] == 'True'
-            local_path = to_host_path(env['K8S_AUTH_SSL_CA_CERT'], private_data_dir)
-            cert = open(local_path, 'r').read()
-            assert cert == 'CERTDATA'
-        else:
-            assert env['K8S_AUTH_VERIFY_SSL'] == 'False'
-            assert 'K8S_AUTH_SSL_CA_CERT' not in env
-
-        assert safe_env['K8S_AUTH_API_KEY'] == HIDDEN_PASSWORD
-
-    def test_aws_cloud_credential(self, job, private_data_dir, mock_me):
-        aws = CredentialType.defaults['aws']()
-        credential = Credential(pk=1, credential_type=aws, inputs={'username': 'bob', 'password': 'secret'})
-        credential.inputs['password'] = encrypt_field(credential, 'password')
-        job.credentials.add(credential)
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-
-        assert env['AWS_ACCESS_KEY_ID'] == 'bob'
-        assert env['AWS_SECRET_ACCESS_KEY'] == 'secret'
-        assert 'AWS_SECURITY_TOKEN' not in env
-        assert safe_env['AWS_SECRET_ACCESS_KEY'] == HIDDEN_PASSWORD
-
-    def test_aws_cloud_credential_with_sts_token(self, private_data_dir, job, mock_me):
-        aws = CredentialType.defaults['aws']()
-        credential = Credential(pk=1, credential_type=aws, inputs={'username': 'bob', 'password': 'secret', 'security_token': 'token'})
-        for key in ('password', 'security_token'):
-            credential.inputs[key] = encrypt_field(credential, key)
-        job.credentials.add(credential)
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-
-        assert env['AWS_ACCESS_KEY_ID'] == 'bob'
-        assert env['AWS_SECRET_ACCESS_KEY'] == 'secret'
-        assert env['AWS_SECURITY_TOKEN'] == 'token'
-        assert safe_env['AWS_SECRET_ACCESS_KEY'] == HIDDEN_PASSWORD
-
-    @pytest.mark.parametrize("cred_env_var", ['GCE_CREDENTIALS_FILE_PATH', 'GOOGLE_APPLICATION_CREDENTIALS'])
-    def test_gce_credentials(self, cred_env_var, private_data_dir, job, mock_me):
-        gce = CredentialType.defaults['gce']()
-        credential = Credential(pk=1, credential_type=gce, inputs={'username': 'bob', 'project': 'some-project', 'ssh_key_data': self.EXAMPLE_PRIVATE_KEY})
-        credential.inputs['ssh_key_data'] = encrypt_field(credential, 'ssh_key_data')
-        job.credentials.add(credential)
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-        runner_path = env[cred_env_var]
-        local_path = to_host_path(runner_path, private_data_dir)
-        json_data = json.load(open(local_path, 'rb'))
-        assert json_data['type'] == 'service_account'
-        assert json_data['private_key'] == self.EXAMPLE_PRIVATE_KEY
-        assert json_data['client_email'] == 'bob'
-        assert json_data['project_id'] == 'some-project'
-
-    def test_azure_rm_with_tenant(self, private_data_dir, job, mock_me):
-        azure = CredentialType.defaults['azure_rm']()
-        credential = Credential(
-            pk=1, credential_type=azure, inputs={'client': 'some-client', 'secret': 'some-secret', 'tenant': 'some-tenant', 'subscription': 'some-subscription'}
-        )
-        credential.inputs['secret'] = encrypt_field(credential, 'secret')
-        job.credentials.add(credential)
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-
-        assert env['AZURE_CLIENT_ID'] == 'some-client'
-        assert env['AZURE_SECRET'] == 'some-secret'
-        assert env['AZURE_TENANT'] == 'some-tenant'
-        assert env['AZURE_SUBSCRIPTION_ID'] == 'some-subscription'
-        assert safe_env['AZURE_SECRET'] == HIDDEN_PASSWORD
-
-    def test_azure_rm_with_password(self, private_data_dir, job, mock_me):
-        azure = CredentialType.defaults['azure_rm']()
-        credential = Credential(
-            pk=1, credential_type=azure, inputs={'subscription': 'some-subscription', 'username': 'bob', 'password': 'secret', 'cloud_environment': 'foobar'}
-        )
-        credential.inputs['password'] = encrypt_field(credential, 'password')
-        job.credentials.add(credential)
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-
-        assert env['AZURE_SUBSCRIPTION_ID'] == 'some-subscription'
-        assert env['AZURE_AD_USER'] == 'bob'
-        assert env['AZURE_PASSWORD'] == 'secret'
-        assert env['AZURE_CLOUD_ENVIRONMENT'] == 'foobar'
-        assert safe_env['AZURE_PASSWORD'] == HIDDEN_PASSWORD
-
-    def test_vmware_credentials(self, private_data_dir, job, mock_me):
-        vmware = CredentialType.defaults['vmware']()
-        credential = Credential(pk=1, credential_type=vmware, inputs={'username': 'bob', 'password': 'secret', 'host': 'https://example.org'})
-        credential.inputs['password'] = encrypt_field(credential, 'password')
-        job.credentials.add(credential)
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-
-        assert env['VMWARE_USER'] == 'bob'
-        assert env['VMWARE_PASSWORD'] == 'secret'
-        assert env['VMWARE_HOST'] == 'https://example.org'
-        assert safe_env['VMWARE_PASSWORD'] == HIDDEN_PASSWORD
-
-    def test_openstack_credentials(self, private_data_dir, job, mock_me):
-        task = jobs.RunJob()
-        task.instance = job
-        openstack = CredentialType.defaults['openstack']()
-        credential = Credential(
-            pk=1, credential_type=openstack, inputs={'username': 'bob', 'password': 'secret', 'project': 'tenant-name', 'host': 'https://keystone.example.org'}
-        )
-        credential.inputs['password'] = encrypt_field(credential, 'password')
-        job.credentials.add(credential)
-
-        private_data_files, ssh_key_data = task.build_private_data_files(job, private_data_dir)
-        env = task.build_env(job, private_data_dir, private_data_files=private_data_files)
-        credential.credential_type.inject_credential(credential, env, {}, [], private_data_dir)
-
-        config_loc = to_host_path(env['OS_CLIENT_CONFIG_FILE'], private_data_dir)
-        shade_config = open(config_loc, 'r').read()
-        assert shade_config == '\n'.join(
-            [
-                'clouds:',
-                '  devstack:',
-                '    auth:',
-                '      auth_url: https://keystone.example.org',
-                '      password: secret',
-                '      project_name: tenant-name',
-                '      username: bob',
-                '    verify: true',
-                '',
-            ]
-        )
-
-    @pytest.mark.parametrize("ca_file", [None, '/path/to/some/file'])
-    def test_rhv_credentials(self, private_data_dir, job, ca_file, mock_me):
-        rhv = CredentialType.defaults['rhv']()
-        inputs = {
-            'host': 'some-ovirt-host.example.org',
-            'username': 'bob',
-            'password': 'some-pass',
-        }
-        if ca_file:
-            inputs['ca_file'] = ca_file
-        credential = Credential(pk=1, credential_type=rhv, inputs=inputs)
-        credential.inputs['password'] = encrypt_field(credential, 'password')
-        job.credentials.add(credential)
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-
-        config = configparser.ConfigParser()
-        host_path = to_host_path(env['OVIRT_INI_PATH'], private_data_dir)
-        config.read(host_path)
-        assert config.get('ovirt', 'ovirt_url') == 'some-ovirt-host.example.org'
-        assert config.get('ovirt', 'ovirt_username') == 'bob'
-        assert config.get('ovirt', 'ovirt_password') == 'some-pass'
-        if ca_file:
-            assert config.get('ovirt', 'ovirt_ca_file') == ca_file
-        else:
-            with pytest.raises(configparser.NoOptionError):
-                config.get('ovirt', 'ovirt_ca_file')
-
     @pytest.mark.parametrize(
         'authorize, expected_authorize',
         [
@@ -1067,6 +1013,7 @@ class TestJobCredentials(TestJobExecution):
             [None, '0'],
         ],
     )
+    @pytest.mark.django_db
     def test_net_credentials(self, authorize, expected_authorize, job, private_data_dir, mock_me):
         task = jobs.RunJob()
         task.instance = job
@@ -1089,258 +1036,9 @@ class TestJobCredentials(TestJobExecution):
         assert env['ANSIBLE_NET_AUTHORIZE'] == expected_authorize
         if authorize:
             assert env['ANSIBLE_NET_AUTH_PASS'] == 'authorizeme'
-        assert open(env['ANSIBLE_NET_SSH_KEYFILE'], 'r').read() == self.EXAMPLE_PRIVATE_KEY
+        with open(env['ANSIBLE_NET_SSH_KEYFILE'], 'r') as f:
+            assert f.read() == self.EXAMPLE_PRIVATE_KEY
         assert safe_env['ANSIBLE_NET_PASSWORD'] == HIDDEN_PASSWORD
-
-    def test_custom_environment_injectors_with_jinja_syntax_error(self, private_data_dir, mock_me):
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'api_token', 'label': 'API Token', 'type': 'string'}]},
-            injectors={'env': {'MY_CLOUD_API_TOKEN': '{{api_token.foo()}}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'api_token': 'ABC123'})
-
-        with pytest.raises(jinja2.exceptions.UndefinedError):
-            credential.credential_type.inject_credential(credential, {}, {}, [], private_data_dir)
-
-    def test_custom_environment_injectors(self, private_data_dir, mock_me):
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'api_token', 'label': 'API Token', 'type': 'string'}]},
-            injectors={'env': {'MY_CLOUD_API_TOKEN': '{{api_token}}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'api_token': 'ABC123'})
-
-        env = {}
-        credential.credential_type.inject_credential(credential, env, {}, [], private_data_dir)
-
-        assert env['MY_CLOUD_API_TOKEN'] == 'ABC123'
-
-    def test_custom_environment_injectors_with_boolean_env_var(self, private_data_dir, mock_me):
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'turbo_button', 'label': 'Turbo Button', 'type': 'boolean'}]},
-            injectors={'env': {'TURBO_BUTTON': '{{turbo_button}}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'turbo_button': True})
-
-        env = {}
-        credential.credential_type.inject_credential(credential, env, {}, [], private_data_dir)
-
-        assert env['TURBO_BUTTON'] == str(True)
-
-    def test_custom_environment_injectors_with_reserved_env_var(self, private_data_dir, job, mock_me):
-        task = jobs.RunJob()
-        task.instance = job
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'api_token', 'label': 'API Token', 'type': 'string'}]},
-            injectors={'env': {'JOB_ID': 'reserved'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'api_token': 'ABC123'})
-        job.credentials.add(credential)
-
-        env = task.build_env(job, private_data_dir)
-
-        assert env['JOB_ID'] == str(job.pk)
-
-    def test_custom_environment_injectors_with_secret_field(self, private_data_dir, mock_me):
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'password', 'label': 'Password', 'type': 'string', 'secret': True}]},
-            injectors={'env': {'MY_CLOUD_PRIVATE_VAR': '{{password}}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'password': 'SUPER-SECRET-123'})
-        credential.inputs['password'] = encrypt_field(credential, 'password')
-
-        env = {}
-        safe_env = {}
-        credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
-
-        assert env['MY_CLOUD_PRIVATE_VAR'] == 'SUPER-SECRET-123'
-        assert 'SUPER-SECRET-123' not in safe_env.values()
-        assert safe_env['MY_CLOUD_PRIVATE_VAR'] == HIDDEN_PASSWORD
-
-    def test_custom_environment_injectors_with_extra_vars(self, private_data_dir, job, mock_me):
-        task = jobs.RunJob()
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'api_token', 'label': 'API Token', 'type': 'string'}]},
-            injectors={'extra_vars': {'api_token': '{{api_token}}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'api_token': 'ABC123'})
-        job.credentials.add(credential)
-
-        args = task.build_args(job, private_data_dir, {})
-        credential.credential_type.inject_credential(credential, {}, {}, args, private_data_dir)
-        extra_vars = parse_extra_vars(args, private_data_dir)
-
-        assert extra_vars["api_token"] == "ABC123"
-        assert hasattr(extra_vars["api_token"], '__UNSAFE__')
-
-    def test_custom_environment_injectors_with_boolean_extra_vars(self, job, private_data_dir, mock_me):
-        task = jobs.RunJob()
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'turbo_button', 'label': 'Turbo Button', 'type': 'boolean'}]},
-            injectors={'extra_vars': {'turbo_button': '{{turbo_button}}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'turbo_button': True})
-        job.credentials.add(credential)
-
-        args = task.build_args(job, private_data_dir, {})
-        credential.credential_type.inject_credential(credential, {}, {}, args, private_data_dir)
-        extra_vars = parse_extra_vars(args, private_data_dir)
-
-        assert extra_vars["turbo_button"] == "True"
-        return ['successful', 0]
-
-    def test_custom_environment_injectors_with_nested_extra_vars(self, private_data_dir, job, mock_me):
-        task = jobs.RunJob()
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'host', 'label': 'Host', 'type': 'string'}]},
-            injectors={'extra_vars': {'auth': {'host': '{{host}}'}}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'host': 'example.com'})
-        job.credentials.add(credential)
-
-        args = task.build_args(job, private_data_dir, {})
-        credential.credential_type.inject_credential(credential, {}, {}, args, private_data_dir)
-        extra_vars = parse_extra_vars(args, private_data_dir)
-
-        assert extra_vars["auth"]["host"] == "example.com"
-
-    def test_custom_environment_injectors_with_templated_extra_vars_key(self, private_data_dir, job, mock_me):
-        task = jobs.RunJob()
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'environment', 'label': 'Environment', 'type': 'string'}, {'id': 'host', 'label': 'Host', 'type': 'string'}]},
-            injectors={'extra_vars': {'{{environment}}_auth': {'host': '{{host}}'}}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'environment': 'test', 'host': 'example.com'})
-        job.credentials.add(credential)
-
-        args = task.build_args(job, private_data_dir, {})
-        credential.credential_type.inject_credential(credential, {}, {}, args, private_data_dir)
-        extra_vars = parse_extra_vars(args, private_data_dir)
-
-        assert extra_vars["test_auth"]["host"] == "example.com"
-
-    def test_custom_environment_injectors_with_complicated_boolean_template(self, job, private_data_dir, mock_me):
-        task = jobs.RunJob()
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'turbo_button', 'label': 'Turbo Button', 'type': 'boolean'}]},
-            injectors={'extra_vars': {'turbo_button': '{% if turbo_button %}FAST!{% else %}SLOW!{% endif %}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'turbo_button': True})
-        job.credentials.add(credential)
-
-        args = task.build_args(job, private_data_dir, {})
-        credential.credential_type.inject_credential(credential, {}, {}, args, private_data_dir)
-        extra_vars = parse_extra_vars(args, private_data_dir)
-
-        assert extra_vars["turbo_button"] == "FAST!"
-
-    def test_custom_environment_injectors_with_secret_extra_vars(self, job, private_data_dir, mock_me):
-        """
-        extra_vars that contain secret field values should be censored in the DB
-        """
-        task = jobs.RunJob()
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'password', 'label': 'Password', 'type': 'string', 'secret': True}]},
-            injectors={'extra_vars': {'password': '{{password}}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'password': 'SUPER-SECRET-123'})
-        credential.inputs['password'] = encrypt_field(credential, 'password')
-        job.credentials.add(credential)
-
-        args = task.build_args(job, private_data_dir, {})
-        credential.credential_type.inject_credential(credential, {}, {}, args, private_data_dir)
-
-        extra_vars = parse_extra_vars(args, private_data_dir)
-        assert extra_vars["password"] == "SUPER-SECRET-123"
-
-    def test_custom_environment_injectors_with_file(self, private_data_dir, mock_me):
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'api_token', 'label': 'API Token', 'type': 'string'}]},
-            injectors={'file': {'template': '[mycloud]\n{{api_token}}'}, 'env': {'MY_CLOUD_INI_FILE': '{{tower.filename}}'}},
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'api_token': 'ABC123'})
-
-        env = {}
-        credential.credential_type.inject_credential(credential, env, {}, [], private_data_dir)
-
-        path = to_host_path(env['MY_CLOUD_INI_FILE'], private_data_dir)
-        assert open(path, 'r').read() == '[mycloud]\nABC123'
-
-    def test_custom_environment_injectors_with_unicode_content(self, private_data_dir, mock_me):
-        value = 'Iñtërnâtiônàlizætiøn'
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': []},
-            injectors={'file': {'template': value}, 'env': {'MY_CLOUD_INI_FILE': '{{tower.filename}}'}},
-        )
-        credential = Credential(
-            pk=1,
-            credential_type=some_cloud,
-        )
-
-        env = {}
-        credential.credential_type.inject_credential(credential, env, {}, [], private_data_dir)
-
-        path = to_host_path(env['MY_CLOUD_INI_FILE'], private_data_dir)
-        assert open(path, 'r').read() == value
-
-    def test_custom_environment_injectors_with_files(self, private_data_dir, mock_me):
-        some_cloud = CredentialType(
-            kind='cloud',
-            name='SomeCloud',
-            managed=False,
-            inputs={'fields': [{'id': 'cert', 'label': 'Certificate', 'type': 'string'}, {'id': 'key', 'label': 'Key', 'type': 'string'}]},
-            injectors={
-                'file': {'template.cert': '[mycert]\n{{cert}}', 'template.key': '[mykey]\n{{key}}'},
-                'env': {'MY_CERT_INI_FILE': '{{tower.filename.cert}}', 'MY_KEY_INI_FILE': '{{tower.filename.key}}'},
-            },
-        )
-        credential = Credential(pk=1, credential_type=some_cloud, inputs={'cert': 'CERT123', 'key': 'KEY123'})
-
-        env = {}
-        credential.credential_type.inject_credential(credential, env, {}, [], private_data_dir)
-
-        cert_path = to_host_path(env['MY_CERT_INI_FILE'], private_data_dir)
-        key_path = to_host_path(env['MY_KEY_INI_FILE'], private_data_dir)
-        assert open(cert_path, 'r').read() == '[mycert]\nCERT123'
-        assert open(key_path, 'r').read() == '[mykey]\nKEY123'
 
     def test_multi_cloud(self, private_data_dir, mock_me):
         gce = CredentialType.defaults['gce']()
@@ -1363,7 +1061,8 @@ class TestJobCredentials(TestJobExecution):
 
         # Because this is testing a mix of multiple cloud creds, we are not going to test the GOOGLE_APPLICATION_CREDENTIALS here
         path = to_host_path(env['GCE_CREDENTIALS_FILE_PATH'], private_data_dir)
-        json_data = json.load(open(path, 'rb'))
+        with open(path, 'rb') as f:
+            json_data = json.load(f)
         assert json_data['type'] == 'service_account'
         assert json_data['private_key'] == self.EXAMPLE_PRIVATE_KEY
         assert json_data['client_email'] == 'bob'
@@ -1371,6 +1070,7 @@ class TestJobCredentials(TestJobExecution):
 
         assert safe_env['AZURE_PASSWORD'] == HIDDEN_PASSWORD
 
+    @pytest.mark.django_db
     def test_awx_task_env(self, settings, private_data_dir, job, mock_me):
         settings.AWX_TASK_ENV = {'FOO': 'BAR'}
         task = jobs.RunJob()
@@ -1378,6 +1078,82 @@ class TestJobCredentials(TestJobExecution):
         env = task.build_env(job, private_data_dir)
 
         assert env['FOO'] == 'BAR'
+
+
+class TestCallbacksEnabled(TestJobExecution):
+    @pytest.fixture(autouse=True)
+    def mock_flag_enabled(self):
+        with mock.patch('awx.main.tasks.jobs.flag_enabled', return_value=False):
+            yield
+
+    def test_callbacks_enabled_default(self, patch_Job, private_data_dir, execution_environment, mock_me):
+        job = Job(project=Project(), inventory=Inventory())
+        job.execution_environment = execution_environment
+
+        task = jobs.RunJob()
+        task.instance = job
+        task._write_extra_vars_file = mock.Mock()
+
+        with mock.patch.object(task, 'build_credentials_list', return_value=[], autospec=True):
+            env = task.build_env(job, private_data_dir)
+
+        assert env['ANSIBLE_CALLBACKS_ENABLED'] == 'indirect_instance_count'
+
+    def test_callbacks_enabled_preserves_user_config(self, patch_Job, private_data_dir, execution_environment, mock_me):
+        job = Job(project=Project(), inventory=Inventory())
+        job.execution_environment = execution_environment
+
+        task = jobs.RunJob()
+        task.instance = job
+        task._write_extra_vars_file = mock.Mock()
+
+        with mock.patch.object(task, 'build_credentials_list', return_value=[], autospec=True):
+            with mock.patch('awx.main.tasks.jobs.read_ansible_config', return_value={'callbacks_enabled': 'custom_callback,another_callback'}):
+                env = task.build_env(job, private_data_dir)
+
+        assert env['ANSIBLE_CALLBACKS_ENABLED'] == 'indirect_instance_count,custom_callback,another_callback'
+
+    def test_callbacks_enabled_uses_comma_delimiter(self, patch_Job, private_data_dir, execution_environment, mock_me):
+        job = Job(project=Project(), inventory=Inventory())
+        job.execution_environment = execution_environment
+
+        task = jobs.RunJob()
+        task.instance = job
+        task._write_extra_vars_file = mock.Mock()
+
+        with mock.patch.object(task, 'build_credentials_list', return_value=[], autospec=True):
+            with mock.patch('awx.main.tasks.jobs.read_ansible_config', return_value={'callbacks_enabled': 'my_callback'}):
+                env = task.build_env(job, private_data_dir)
+
+        assert env['ANSIBLE_CALLBACKS_ENABLED'] == 'indirect_instance_count,my_callback'
+
+    def test_collect_host_queries_set_when_indirect_node_counting_enabled(self, patch_Job, private_data_dir, execution_environment, mock_me):
+        job = Job(project=Project(), inventory=Inventory())
+        job.execution_environment = execution_environment
+
+        task = jobs.RunJob()
+        task.instance = job
+        task._write_extra_vars_file = mock.Mock()
+
+        with mock.patch.object(task, 'build_credentials_list', return_value=[], autospec=True):
+            with mock.patch('awx.main.tasks.jobs.settings.INDIRECT_NODE_COUNTING_ENABLED', True):
+                env = task.build_env(job, private_data_dir)
+
+        assert env['AWX_COLLECT_HOST_QUERIES'] == '1'
+
+    def test_collect_host_queries_not_set_when_indirect_node_counting_disabled(self, patch_Job, private_data_dir, execution_environment, mock_me):
+        job = Job(project=Project(), inventory=Inventory())
+        job.execution_environment = execution_environment
+
+        task = jobs.RunJob()
+        task.instance = job
+        task._write_extra_vars_file = mock.Mock()
+
+        with mock.patch.object(task, 'build_credentials_list', return_value=[], autospec=True):
+            with mock.patch('awx.main.tasks.jobs.settings.INDIRECT_NODE_COUNTING_ENABLED', False):
+                env = task.build_env(job, private_data_dir)
+
+        assert 'AWX_COLLECT_HOST_QUERIES' not in env
 
 
 @pytest.mark.usefixtures("patch_Organization")
@@ -1556,7 +1332,110 @@ class TestProjectUpdateCredentials(TestJobExecution):
         assert env['FOO'] == 'BAR'
 
 
+class TestProjectUpdateSignatureValidation(TestJobExecution):
+    """Tests that ProjectUpdate.save() adds GPG validation job tags when a
+    signature_validation_credential is set on the project."""
+
+    def test_project_update_with_signature_credential_adds_validation_tags(self):
+        gpg_credential_type = CredentialType(pk=1, namespace='gpg_public_key', kind='cryptography')
+        gpg_credential = Credential(pk=1, credential_type=gpg_credential_type)
+        project = Project(pk=1, organization=Organization(pk=1), scm_type='git', signature_validation_credential=gpg_credential)
+        project_update = ProjectUpdate(pk=1, project=project, scm_type='git')
+        project_update.websocket_emit_status = mock.Mock()
+
+        # Simulate the save logic that sets job_tags without hitting the database
+        with mock.patch.object(UnifiedJob, 'save', return_value=None):
+            project_update.save()
+
+        assert 'validation_gpg_public_key' in project_update.job_tags
+        assert 'validation_checksum_manifest' in project_update.job_tags
+        assert 'update_git' in project_update.job_tags
+
+    def test_project_update_without_signature_credential_no_validation_tags(self):
+        project = Project(pk=1, organization=Organization(pk=1), scm_type='git')
+        project_update = ProjectUpdate(pk=1, project=project, scm_type='git')
+        project_update.websocket_emit_status = mock.Mock()
+
+        with mock.patch.object(UnifiedJob, 'save', return_value=None):
+            project_update.save()
+
+        assert 'validation_gpg_public_key' not in project_update.job_tags
+        assert 'validation_checksum_manifest' not in project_update.job_tags
+        assert 'update_git' in project_update.job_tags
+        assert 'install_roles' in project_update.job_tags
+        assert 'install_collections' in project_update.job_tags
+
+
+@pytest.mark.django_db
+class TestProjectUpdateRefspec(TestJobExecution):
+    @pytest.fixture
+    def project_update(self, execution_environment):
+        org = Organization(pk=1)
+        proj = Project(pk=1, organization=org, allow_override=True)
+        project_update = ProjectUpdate(pk=1, project=proj, scm_type='git')
+        project_update.websocket_emit_status = mock.Mock()
+        project_update.execution_environment = execution_environment
+        return project_update
+
+    def test_refspec_with_allow_override_includes_plus_prefix(self, project_update, private_data_dir, mock_me):
+        """Test that refspec includes + prefix to allow non-fast-forward updates when allow_override is True"""
+        task = jobs.RunProjectUpdate()
+        task.instance = project_update
+
+        # Call build_extra_vars_file which sets the refspec
+        with mock.patch.object(Licenser, 'validate', lambda *args, **kw: {}):
+            task.build_extra_vars_file(project_update, private_data_dir)
+
+        # Read the extra vars file to check the refspec
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
+
+        # Verify the refspec includes the + prefix for force updates
+        assert 'scm_refspec' in extra_vars
+        assert extra_vars['scm_refspec'] == '+refs/heads/*:refs/remotes/origin/*'
+
+    def test_custom_refspec_not_overridden(self, project_update, private_data_dir, mock_me):
+        """Test that custom user-provided refspec is not overridden"""
+        task = jobs.RunProjectUpdate()
+        task.instance = project_update
+        project_update.scm_refspec = 'refs/pull/*/head:refs/remotes/origin/pr/*'
+
+        with mock.patch.object(Licenser, 'validate', lambda *args, **kw: {}):
+            task.build_extra_vars_file(project_update, private_data_dir)
+
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
+
+        # Custom refspec should be preserved
+        assert extra_vars['scm_refspec'] == 'refs/pull/*/head:refs/remotes/origin/pr/*'
+
+    def test_no_refspec_without_allow_override(self, execution_environment, private_data_dir, mock_me):
+        """Test that no refspec is set when allow_override is False"""
+        org = Organization(pk=1)
+        proj = Project(pk=1, organization=org, allow_override=False)
+        project_update = ProjectUpdate(pk=1, project=proj, scm_type='git')
+        project_update.websocket_emit_status = mock.Mock()
+        project_update.execution_environment = execution_environment
+
+        task = jobs.RunProjectUpdate()
+        task.instance = project_update
+
+        with mock.patch.object(Licenser, 'validate', lambda *args, **kw: {}):
+            task.build_extra_vars_file(project_update, private_data_dir)
+
+        with open(os.path.join(private_data_dir, 'env', 'extravars')) as fd:
+            extra_vars = yaml.load(fd, Loader=SafeLoader)
+
+        # No refspec should be set
+        assert 'scm_refspec' not in extra_vars
+
+
 class TestInventoryUpdateCredentials(TestJobExecution):
+    @pytest.fixture(autouse=True)
+    def mock_flag_enabled(self):
+        with mock.patch('awx.main.tasks.jobs.flag_enabled', return_value=False):
+            yield
+
     @pytest.fixture
     def inventory_update(self, execution_environment):
         return InventoryUpdate(pk=1, execution_environment=execution_environment, inventory_source=InventorySource(pk=1, inventory=Inventory(pk=1)))
@@ -1621,10 +1500,10 @@ class TestInventoryUpdateCredentials(TestJobExecution):
             if credential:
                 credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
 
-        env["VMWARE_USER"] == "bob",
-        env["VMWARE_PASSWORD"] == "secret",
-        env["VMWARE_HOST"] == "https://example.org",
-        env["VMWARE_VALIDATE_CERTS"] == "False",
+        (env["VMWARE_USER"] == "bob",)
+        (env["VMWARE_PASSWORD"] == "secret",)
+        (env["VMWARE_HOST"] == "https://example.org",)
+        (env["VMWARE_VALIDATE_CERTS"] == "False",)
 
     def test_azure_rm_source_with_tenant(self, private_data_dir, inventory_update, mocker, mock_me):
         task = jobs.RunInventoryUpdate()
@@ -1716,7 +1595,8 @@ class TestInventoryUpdateCredentials(TestJobExecution):
                     credential.credential_type.inject_credential(credential, env, safe_env, [], private_data_dir)
 
             assert env['GCE_ZONE'] == expected_gce_zone
-            json_data = json.load(open(env[cred_env_var], 'rb'))
+            with open(env[cred_env_var], 'rb') as f:
+                json_data = json.load(f)
             assert json_data['type'] == 'service_account'
             assert json_data['private_key'] == self.EXAMPLE_PRIVATE_KEY
             assert json_data['client_email'] == 'bob'
@@ -1745,7 +1625,8 @@ class TestInventoryUpdateCredentials(TestJobExecution):
         env = task.build_env(inventory_update, private_data_dir, private_data_files)
 
         path = to_host_path(env['OS_CLIENT_CONFIG_FILE'], private_data_dir)
-        shade_config = open(path, 'r').read()
+        with open(path, 'r') as f:
+            shade_config = f.read()
         assert (
             '\n'.join(
                 [
@@ -1908,8 +1789,8 @@ def test_fcntl_ioerror():
 
 
 @mock.patch('os.open')
-@mock.patch('logging.getLogger')
-def test_acquire_lock_open_fail_logged(logging_getLogger, os_open, mock_me):
+@mock.patch('awx.main.tasks.jobs.logger')
+def test_acquire_lock_open_fail_logged(logger_mock, os_open, mock_me):
     err = OSError()
     err.errno = 3
     err.strerror = 'dummy message'
@@ -1919,21 +1800,18 @@ def test_acquire_lock_open_fail_logged(logging_getLogger, os_open, mock_me):
 
     os_open.side_effect = err
 
-    logger = mock.Mock()
-    logging_getLogger.return_value = logger
-
     ProjectUpdate = jobs.RunProjectUpdate()
 
     with pytest.raises(OSError):
         ProjectUpdate.acquire_lock(instance)
-    assert logger.err.called_with("I/O error({0}) while trying to open lock file [{1}]: {2}".format(3, 'this_file_does_not_exist', 'dummy message'))
+    logger_mock.error.assert_called_with("I/O error({0}) while trying to open lock file [{1}]: {2}".format(3, 'this_file_does_not_exist', 'dummy message'))
 
 
 @mock.patch('os.open')
 @mock.patch('os.close')
-@mock.patch('logging.getLogger')
+@mock.patch('awx.main.tasks.jobs.logger')
 @mock.patch('fcntl.lockf')
-def test_acquire_lock_acquisition_fail_logged(fcntl_lockf, logging_getLogger, os_close, os_open, mock_me):
+def test_acquire_lock_acquisition_fail_logged(fcntl_lockf, logger_mock, os_close, os_open, mock_me):
     err = IOError()
     err.errno = 3
     err.strerror = 'dummy message'
@@ -1944,16 +1822,603 @@ def test_acquire_lock_acquisition_fail_logged(fcntl_lockf, logging_getLogger, os
 
     os_open.return_value = 3
 
-    logger = mock.Mock()
-    logging_getLogger.return_value = logger
-
     fcntl_lockf.side_effect = err
 
     ProjectUpdate = jobs.RunProjectUpdate()
     with pytest.raises(IOError):
         ProjectUpdate.acquire_lock(instance)
     os_close.assert_called_with(3)
-    assert logger.err.called_with("I/O error({0}) while trying to acquire lock on file [{1}]: {2}".format(3, 'this_file_does_not_exist', 'dummy message'))
+    logger_mock.error.assert_called_with(
+        "I/O error({0}) while trying to acquire lock on file [{1}]: {2}".format(3, 'this_file_does_not_exist', 'dummy message')
+    )
+
+
+@pytest.mark.parametrize(
+    'kwargs,expected_flag',
+    [
+        ({}, fcntl.LOCK_EX | fcntl.LOCK_NB),  # default is exclusive
+        ({'exclusive': False}, fcntl.LOCK_SH | fcntl.LOCK_NB),
+    ],
+)
+@mock.patch('os.open')
+@mock.patch('fcntl.lockf')
+def test_acquire_lock_flag(fcntl_lockf, os_open, mock_me, kwargs, expected_flag):
+    """acquire_lock passes the correct fcntl flag based on the exclusive parameter."""
+    instance = mock.Mock()
+    instance.get_lock_file.return_value = '/fake/path.lock'
+    os_open.return_value = 3
+
+    task = jobs.RunProjectUpdate()
+    task.acquire_lock(instance, **kwargs)
+
+    assert fcntl_lockf.call_args[0][1] == expected_flag
+
+
+# Each entry: (sync_needs, has_pk, expected exclusive= sequence, expected refresh_from_db count)
+# - copy-only path: refresh once under LOCK_SH
+# - upgrade path: refresh under LOCK_SH and again under LOCK_EX (POSIX locks cannot
+#   be upgraded atomically, so state may change in the gap between releasing SH and
+#   acquiring EX)
+# - pk=None cases: refresh_from_db is skipped (unsaved model instances used in some tests)
+@pytest.mark.parametrize(
+    'sync_needs,has_pk,expected_exclusive_seq,expected_refresh_count',
+    [
+        ([], True, [False], 1),  # copy-only: shared lock, refresh once
+        (['update_git'], True, [False, True], 2),  # upgrade path: refresh under SH and EX
+        ([], False, [False], 0),  # copy-only, no pk: refresh skipped
+        (['update_git'], False, [False, True], 0),  # upgrade path, no pk: refresh skipped
+    ],
+)
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.release_lock')
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.acquire_lock')
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.sync_and_copy_without_lock')
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.get_sync_needs')
+def test_sync_and_copy_lock_behavior(
+    get_sync_needs, sync_without_lock, acquire_lock, release_lock, mock_me, sync_needs, has_pk, expected_exclusive_seq, expected_refresh_count
+):
+    """sync_and_copy acquires LOCK_SH first, upgrading to LOCK_EX only when a sync is needed.
+    project.refresh_from_db() is called after each lock acquisition to ensure current DB state,
+    but only when the project has a pk (i.e. is persisted to the database)."""
+    get_sync_needs.return_value = sync_needs
+
+    project = mock.Mock()
+    project.pk = 1 if has_pk else None
+    project.get_reason_if_failed.return_value = None
+    project.scm_type = 'git'
+    project.scm_branch = 'main'
+
+    task = jobs.RunJob()
+    task.instance = mock.Mock()
+    task.instance.id = 1
+    task.update_model = mock.Mock(return_value=task.instance)
+
+    task.sync_and_copy(project, '/fake/private_data_dir')
+
+    assert acquire_lock.call_count == len(expected_exclusive_seq)
+    for i, exclusive in enumerate(expected_exclusive_seq):
+        assert acquire_lock.call_args_list[i] == mock.call(project, task.instance.id, exclusive=exclusive)
+    assert release_lock.call_count == len(expected_exclusive_seq)
+    assert project.refresh_from_db.call_count == expected_refresh_count
+
+
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.release_lock')
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.acquire_lock')
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.sync_and_copy_without_lock')
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.get_sync_needs')
+def test_sync_and_copy_get_sync_needs_called_under_shared_lock(get_sync_needs, sync_without_lock, acquire_lock, release_lock, mock_me):
+    """get_sync_needs is called after acquiring LOCK_SH, not before any lock."""
+    call_order = []
+    acquire_lock.side_effect = lambda *a, **kw: call_order.append('acquire')
+    get_sync_needs.side_effect = lambda *a, **kw: call_order.append('get_sync_needs') or []
+
+    project = mock.Mock()
+    project.get_reason_if_failed.return_value = None
+    project.scm_type = 'git'
+    project.scm_branch = 'main'
+
+    task = jobs.RunJob()
+    task.instance = mock.Mock()
+    task.instance.id = 1
+    task.update_model = mock.Mock(return_value=task.instance)
+
+    task.sync_and_copy(project, '/fake/private_data_dir')
+
+    assert call_order[0] == 'acquire', 'lock must be acquired before get_sync_needs is called'
+    assert call_order[1] == 'get_sync_needs'
+
+
+@mock.patch('awx.main.tasks.jobs.RunProjectUpdate.make_local_copy')
+@mock.patch('awx.main.tasks.jobs.RunProjectUpdate.run')
+@mock.patch('awx.main.tasks.jobs.RunProjectUpdate.__init__', return_value=None)
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.spawn_project_sync')
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.get_sync_needs')
+def test_sync_and_copy_without_lock_calls_make_local_copy(get_sync_needs, spawn_sync, pu_init, pu_run, make_copy, mock_me):
+    """make_local_copy must be called in sync_and_copy_without_lock after a successful sync,
+    not deferred to post_run_hook where cache-management errors could silently prevent it."""
+    get_sync_needs.return_value = ['update_insights']
+
+    local_sync = mock.Mock()
+    local_sync.scm_revision = 'abc123'
+    local_sync.status = 'successful'
+    spawn_sync.return_value = local_sync
+
+    project = mock.Mock()
+    project.scm_type = 'insights'
+
+    task = jobs.RunJob()
+    task.instance = mock.Mock(spec=Job)
+    task.instance.pk = 1
+    task.update_model = mock.Mock(return_value=task.instance)
+
+    task.sync_and_copy_without_lock(project, '/fake/private_data_dir')
+
+    make_copy.assert_called_once_with(local_sync, '/fake/private_data_dir')
+
+
+@mock.patch('awx.main.tasks.jobs.RunProjectUpdate.make_local_copy')
+@mock.patch('awx.main.tasks.jobs.RunProjectUpdate.run')
+@mock.patch('awx.main.tasks.jobs.RunProjectUpdate.__init__', return_value=None)
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.spawn_project_sync')
+@mock.patch('awx.main.tasks.jobs.SourceControlMixin.get_sync_needs')
+def test_sync_and_copy_without_lock_skips_copy_on_non_successful_sync(get_sync_needs, spawn_sync, pu_init, pu_run, make_copy, mock_me):
+    """make_local_copy must not be called when the sync status is not successful,
+    e.g. when receptor returns early due to quota exhaustion."""
+    get_sync_needs.return_value = ['update_insights']
+
+    local_sync = mock.Mock()
+    local_sync.status = 'pending'
+    local_sync.name = 'Test Sync'
+    local_sync.id = 42
+    spawn_sync.return_value = local_sync
+
+    project = mock.Mock()
+    project.scm_type = 'insights'
+
+    task = jobs.RunJob()
+    task.instance = mock.Mock(spec=Job)
+    task.instance.pk = 1
+    task.update_model = mock.Mock(return_value=task.instance)
+
+    with pytest.raises(RuntimeError, match='Project sync failed with status: pending'):
+        task.sync_and_copy_without_lock(project, '/fake/private_data_dir')
+
+    make_copy.assert_not_called()
+
+
+class TestClearProjectCachePreservesReqcache:
+    def test_reqcache_entries_preserved(self, tmp_path):
+        cache_dir = tmp_path / 'cache'
+        cache_dir.mkdir()
+        (cache_dir / 'abc123').mkdir()
+        (cache_dir / 'reqcache_deadbeef').mkdir()
+        (cache_dir / 'reqcache_cafebabe').mkdir()
+        (cache_dir / 'old_revision').mkdir()
+        (cache_dir / 'stage').mkdir()
+
+        jobs.RunProjectUpdate.clear_project_cache(str(cache_dir), 'abc123')
+
+        remaining = set(os.listdir(cache_dir))
+        assert 'abc123' in remaining
+        assert 'reqcache_deadbeef' in remaining
+        assert 'reqcache_cafebabe' in remaining
+        assert 'stage' in remaining
+        assert 'old_revision' not in remaining
+
+    def test_no_reqcache_entries(self, tmp_path):
+        cache_dir = tmp_path / 'cache'
+        cache_dir.mkdir()
+        (cache_dir / 'keep_me').mkdir()
+        (cache_dir / 'delete_me').mkdir()
+
+        jobs.RunProjectUpdate.clear_project_cache(str(cache_dir), 'keep_me')
+
+        remaining = set(os.listdir(cache_dir))
+        assert 'keep_me' in remaining
+        assert 'delete_me' not in remaining
+
+    def test_evicts_oldest_reqcache_when_over_limit(self, tmp_path):
+        cache_dir = tmp_path / 'cache'
+        cache_dir.mkdir()
+        (cache_dir / 'current').mkdir()
+
+        for i in range(12):
+            entry = cache_dir / f'reqcache_hash{i:02d}'
+            entry.mkdir()
+            os.utime(str(entry), (1000 + i, 1000 + i))
+
+        jobs.RunProjectUpdate.clear_project_cache(str(cache_dir), 'current', max_reqcache=10)
+
+        remaining = set(os.listdir(cache_dir))
+        assert 'reqcache_hash00' not in remaining
+        assert 'reqcache_hash01' not in remaining
+        assert 'reqcache_hash02' in remaining
+        assert 'reqcache_hash11' in remaining
+        assert len([e for e in remaining if e.startswith('reqcache_')]) == 10
+
+    def test_eviction_protects_current_reqcache(self, tmp_path):
+        cache_dir = tmp_path / 'cache'
+        cache_dir.mkdir()
+        (cache_dir / 'current').mkdir()
+
+        stage_dir = cache_dir / 'stage'
+        stage_dir.mkdir()
+        (stage_dir / '.requirements_hash').write_text('hash00')
+
+        for i in range(12):
+            entry = cache_dir / f'reqcache_hash{i:02d}'
+            entry.mkdir()
+            os.utime(str(entry), (1000 + i, 1000 + i))
+
+        jobs.RunProjectUpdate.clear_project_cache(str(cache_dir), 'current', max_reqcache=10)
+
+        remaining = set(os.listdir(cache_dir))
+        # hash00 is the oldest but should be protected (current update's hash)
+        assert 'reqcache_hash00' in remaining
+        # hash01 is the next oldest and should be evicted
+        assert 'reqcache_hash01' not in remaining
+        # hash02+ should survive (only 1 non-protected entry evicted)
+        assert 'reqcache_hash02' in remaining
+        assert 'reqcache_hash11' in remaining
+
+
+class TestSyncRequirementsCache:
+    def test_saves_collections_to_reqcache(self, tmp_path):
+        base_path = tmp_path / 'cache'
+        base_path.mkdir()
+        cache_path = base_path / 'abc123'
+        cache_path.mkdir()
+
+        # Simulate a galaxy install that produced collections
+        collections_dir = cache_path / 'requirements_collections'
+        collections_dir.mkdir()
+        (collections_dir / 'ansible_collections').mkdir()
+        (collections_dir / 'ansible_collections' / 'test.txt').write_text('test')
+
+        # Write the hash marker
+        (cache_path / '.requirements_hash').write_text('deadbeef1234')
+
+        jobs.RunProjectUpdate._sync_requirements_cache(str(base_path), str(cache_path))
+
+        reqcache = base_path / 'reqcache_deadbeef1234' / 'requirements_collections'
+        assert reqcache.exists()
+        assert (reqcache / 'ansible_collections' / 'test.txt').read_text() == 'test'
+
+    def test_skips_when_no_hash_file(self, tmp_path):
+        base_path = tmp_path / 'cache'
+        base_path.mkdir()
+        cache_path = base_path / 'abc123'
+        cache_path.mkdir()
+
+        jobs.RunProjectUpdate._sync_requirements_cache(str(base_path), str(cache_path))
+
+        entries = os.listdir(base_path)
+        assert not any(e.startswith('reqcache_') for e in entries)
+
+    def test_no_partial_cache_on_copytree_failure(self, tmp_path):
+        base_path = tmp_path / 'cache'
+        base_path.mkdir()
+        cache_path = base_path / 'abc123'
+        cache_path.mkdir()
+
+        collections_dir = cache_path / 'requirements_collections'
+        collections_dir.mkdir()
+        (collections_dir / 'test.txt').write_text('test')
+        (cache_path / '.requirements_hash').write_text('deadbeef1234')
+
+        with mock.patch('shutil.copytree', side_effect=OSError('disk full')):
+            try:
+                jobs.RunProjectUpdate._sync_requirements_cache(str(base_path), str(cache_path))
+            except OSError:
+                pass
+
+        reqcache = base_path / 'reqcache_deadbeef1234'
+        assert not reqcache.exists()
+        tmp_dirs = [e for e in os.listdir(base_path) if e.startswith('.reqcache_')]
+        assert len(tmp_dirs) == 0
+
+    def test_creates_tarball_after_sync(self, tmp_path):
+        base_path = tmp_path / 'cache'
+        base_path.mkdir()
+        cache_path = base_path / 'abc123'
+        cache_path.mkdir()
+
+        collections_dir = cache_path / 'requirements_collections'
+        collections_dir.mkdir()
+        (collections_dir / 'ansible_collections').mkdir()
+        (collections_dir / 'ansible_collections' / 'test.txt').write_text('test')
+        (cache_path / '.requirements_hash').write_text('deadbeef1234')
+
+        jobs.RunProjectUpdate._sync_requirements_cache(str(base_path), str(cache_path))
+
+        tar_path = base_path / 'reqcache_deadbeef1234' / 'requirements_collections.tar'
+        assert tar_path.exists()
+        with tarfile.open(str(tar_path), 'r') as tar:
+            names = tar.getnames()
+            assert 'requirements_collections/ansible_collections/test.txt' in names
+
+    def test_skips_when_reqcache_already_exists(self, tmp_path):
+        base_path = tmp_path / 'cache'
+        base_path.mkdir()
+        cache_path = base_path / 'abc123'
+        cache_path.mkdir()
+
+        # Pre-existing reqcache
+        reqcache = base_path / 'reqcache_deadbeef1234' / 'requirements_collections'
+        reqcache.mkdir(parents=True)
+        (reqcache / 'existing.txt').write_text('original')
+
+        # New cache with same hash but different content
+        collections_dir = cache_path / 'requirements_collections'
+        collections_dir.mkdir()
+        (collections_dir / 'new.txt').write_text('new')
+        (cache_path / '.requirements_hash').write_text('deadbeef1234')
+
+        jobs.RunProjectUpdate._sync_requirements_cache(str(base_path), str(cache_path))
+
+        # Should not overwrite existing reqcache
+        assert (reqcache / 'existing.txt').read_text() == 'original'
+        assert not (reqcache / 'new.txt').exists()
+
+
+class TestMakeLocalCopyReqcacheFallback:
+    def test_falls_back_to_reqcache(self, tmp_path):
+        cache_base = tmp_path / 'cache'
+        cache_base.mkdir()
+
+        # Create cache_id directory with hash pointer but no collections
+        cache_id_dir = cache_base / 'abc123'
+        cache_id_dir.mkdir()
+        (cache_id_dir / '.requirements_hash').write_text('deadbeef1234')
+
+        # Create reqcache with collections
+        reqcache_collections = cache_base / 'reqcache_deadbeef1234' / 'requirements_collections'
+        reqcache_collections.mkdir(parents=True)
+        (reqcache_collections / 'community').mkdir()
+        (reqcache_collections / 'community' / 'general.txt').write_text('collection content')
+
+        # Create project path
+        project_path = tmp_path / 'project'
+        project_path.mkdir()
+        (project_path / 'playbook.yml').write_text('- hosts: all')
+
+        # Create job private data dir
+        job_dir = tmp_path / 'job'
+        job_dir.mkdir()
+
+        project = mock.Mock()
+        project.get_project_path.return_value = str(project_path)
+        project.get_cache_path.return_value = str(cache_base)
+        project.cache_id = 'abc123'
+        project.pk = 1
+
+        with mock.patch('awx.main.tasks.jobs.settings') as mock_settings:
+            mock_settings.AWX_COLLECTIONS_ENABLED = True
+            mock_settings.AWX_ROLES_ENABLED = False
+            jobs.RunProjectUpdate.make_local_copy(project, str(job_dir))
+
+        # Collections should be copied from reqcache
+        dest = job_dir / 'requirements_collections' / 'community' / 'general.txt'
+        assert dest.exists()
+        assert dest.read_text() == 'collection content'
+
+    def test_uses_tarball_from_reqcache(self, tmp_path):
+        cache_base = tmp_path / 'cache'
+        cache_base.mkdir()
+
+        cache_id_dir = cache_base / 'abc123'
+        cache_id_dir.mkdir()
+        (cache_id_dir / '.requirements_hash').write_text('deadbeef1234')
+
+        # Create reqcache with collections directory AND tarball
+        reqcache = cache_base / 'reqcache_deadbeef1234'
+        reqcache.mkdir()
+        reqcache_collections = reqcache / 'requirements_collections'
+        reqcache_collections.mkdir()
+        (reqcache_collections / 'community').mkdir()
+        (reqcache_collections / 'community' / 'general.txt').write_text('collection content')
+
+        tar_path = reqcache / 'requirements_collections.tar'
+        with tarfile.open(str(tar_path), 'w') as tar:
+            tar.add(str(reqcache_collections), arcname='requirements_collections')
+
+        project_path = tmp_path / 'project'
+        project_path.mkdir()
+        (project_path / 'playbook.yml').write_text('- hosts: all')
+
+        job_dir = tmp_path / 'job'
+        job_dir.mkdir()
+
+        project = mock.Mock()
+        project.get_project_path.return_value = str(project_path)
+        project.get_cache_path.return_value = str(cache_base)
+        project.cache_id = 'abc123'
+        project.pk = 1
+
+        with mock.patch('awx.main.tasks.jobs.settings') as mock_settings:
+            mock_settings.AWX_COLLECTIONS_ENABLED = True
+            mock_settings.AWX_ROLES_ENABLED = False
+            jobs.RunProjectUpdate.make_local_copy(project, str(job_dir))
+
+        dest = job_dir / 'requirements_collections' / 'community' / 'general.txt'
+        assert dest.exists()
+        assert dest.read_text() == 'collection content'
+
+    def test_direct_cache_ignores_reqcache_tarball(self, tmp_path):
+        """Direct cache hit must use copytree, not a reqcache tarball that could have stale content."""
+        cache_base = tmp_path / 'cache'
+        cache_base.mkdir()
+
+        cache_id_dir = cache_base / 'abc123'
+        cache_id_dir.mkdir()
+        direct_collections = cache_id_dir / 'requirements_collections'
+        direct_collections.mkdir()
+        (direct_collections / 'direct.txt').write_text('direct content')
+        (cache_id_dir / '.requirements_hash').write_text('deadbeef1234')
+
+        # Reqcache tarball with DIFFERENT content — must not be used
+        reqcache = cache_base / 'reqcache_deadbeef1234'
+        reqcache.mkdir()
+        stale_dir = tmp_path / '_stale'
+        stale_dir.mkdir()
+        stale_collections = stale_dir / 'requirements_collections'
+        stale_collections.mkdir()
+        (stale_collections / 'direct.txt').write_text('stale tarball content')
+        tar_path = reqcache / 'requirements_collections.tar'
+        with tarfile.open(str(tar_path), 'w') as tar:
+            tar.add(str(stale_collections), arcname='requirements_collections')
+
+        project_path = tmp_path / 'project'
+        project_path.mkdir()
+        (project_path / 'playbook.yml').write_text('- hosts: all')
+
+        job_dir = tmp_path / 'job'
+        job_dir.mkdir()
+
+        project = mock.Mock()
+        project.get_project_path.return_value = str(project_path)
+        project.get_cache_path.return_value = str(cache_base)
+        project.cache_id = 'abc123'
+        project.pk = 1
+
+        with mock.patch('awx.main.tasks.jobs.settings') as mock_settings:
+            mock_settings.AWX_COLLECTIONS_ENABLED = True
+            mock_settings.AWX_ROLES_ENABLED = False
+            jobs.RunProjectUpdate.make_local_copy(project, str(job_dir))
+
+        dest = job_dir / 'requirements_collections' / 'direct.txt'
+        assert dest.exists()
+        assert dest.read_text() == 'direct content'
+
+    def test_tarball_partial_extract_falls_back_to_copytree(self, tmp_path):
+        """If tarball extraction partially writes then fails, copytree fallback must still work."""
+        cache_base = tmp_path / 'cache'
+        cache_base.mkdir()
+
+        cache_id_dir = cache_base / 'abc123'
+        cache_id_dir.mkdir()
+        (cache_id_dir / '.requirements_hash').write_text('deadbeef1234')
+
+        reqcache = cache_base / 'reqcache_deadbeef1234'
+        reqcache.mkdir()
+        reqcache_collections = reqcache / 'requirements_collections'
+        reqcache_collections.mkdir()
+        (reqcache_collections / 'community').mkdir()
+        (reqcache_collections / 'community' / 'general.txt').write_text('collection content')
+
+        # Create a valid tarball that we'll make fail during extraction
+        tar_path = reqcache / 'requirements_collections.tar'
+        with tarfile.open(str(tar_path), 'w') as tar:
+            tar.add(str(reqcache_collections), arcname='requirements_collections')
+
+        project_path = tmp_path / 'project'
+        project_path.mkdir()
+        (project_path / 'playbook.yml').write_text('- hosts: all')
+
+        job_dir = tmp_path / 'job'
+        job_dir.mkdir()
+
+        # Simulate partial extraction: create dest dir to mimic what a failed extractall leaves behind
+        partial_dest = job_dir / 'requirements_collections'
+        partial_dest.mkdir()
+
+        project = mock.Mock()
+        project.get_project_path.return_value = str(project_path)
+        project.get_cache_path.return_value = str(cache_base)
+        project.cache_id = 'abc123'
+        project.pk = 1
+
+        original_open = tarfile.open
+
+        def failing_tarfile_open(*args, **kwargs):
+            tar = original_open(*args, **kwargs)
+
+            def raise_after_partial(*a, **kw):
+                raise OSError("Simulated extraction failure")
+
+            tar.extractall = raise_after_partial
+            return tar
+
+        with mock.patch('awx.main.tasks.jobs.settings') as mock_settings:
+            mock_settings.AWX_COLLECTIONS_ENABLED = True
+            mock_settings.AWX_ROLES_ENABLED = False
+            with mock.patch('awx.main.tasks.jobs.tarfile.open', side_effect=failing_tarfile_open):
+                jobs.RunProjectUpdate.make_local_copy(project, str(job_dir))
+
+        dest = job_dir / 'requirements_collections' / 'community' / 'general.txt'
+        assert dest.exists()
+        assert dest.read_text() == 'collection content'
+
+    def test_falls_back_to_copytree_when_no_tarball(self, tmp_path):
+        cache_base = tmp_path / 'cache'
+        cache_base.mkdir()
+
+        cache_id_dir = cache_base / 'abc123'
+        cache_id_dir.mkdir()
+        (cache_id_dir / '.requirements_hash').write_text('deadbeef1234')
+
+        # Reqcache with directory but NO tarball
+        reqcache_collections = cache_base / 'reqcache_deadbeef1234' / 'requirements_collections'
+        reqcache_collections.mkdir(parents=True)
+        (reqcache_collections / 'community').mkdir()
+        (reqcache_collections / 'community' / 'general.txt').write_text('collection content')
+
+        project_path = tmp_path / 'project'
+        project_path.mkdir()
+        (project_path / 'playbook.yml').write_text('- hosts: all')
+
+        job_dir = tmp_path / 'job'
+        job_dir.mkdir()
+
+        project = mock.Mock()
+        project.get_project_path.return_value = str(project_path)
+        project.get_cache_path.return_value = str(cache_base)
+        project.cache_id = 'abc123'
+        project.pk = 1
+
+        with mock.patch('awx.main.tasks.jobs.settings') as mock_settings:
+            mock_settings.AWX_COLLECTIONS_ENABLED = True
+            mock_settings.AWX_ROLES_ENABLED = False
+            jobs.RunProjectUpdate.make_local_copy(project, str(job_dir))
+
+        # Should still work via copytree fallback
+        dest = job_dir / 'requirements_collections' / 'community' / 'general.txt'
+        assert dest.exists()
+        assert dest.read_text() == 'collection content'
+
+    def test_uses_direct_cache_when_available(self, tmp_path):
+        cache_base = tmp_path / 'cache'
+        cache_base.mkdir()
+
+        # Create cache_id directory with collections directly present
+        cache_id_dir = cache_base / 'abc123'
+        cache_id_dir.mkdir()
+        direct_collections = cache_id_dir / 'requirements_collections'
+        direct_collections.mkdir()
+        (direct_collections / 'direct.txt').write_text('direct content')
+
+        # Create project path
+        project_path = tmp_path / 'project'
+        project_path.mkdir()
+        (project_path / 'playbook.yml').write_text('- hosts: all')
+
+        job_dir = tmp_path / 'job'
+        job_dir.mkdir()
+
+        project = mock.Mock()
+        project.get_project_path.return_value = str(project_path)
+        project.get_cache_path.return_value = str(cache_base)
+        project.cache_id = 'abc123'
+        project.pk = 1
+
+        with mock.patch('awx.main.tasks.jobs.settings') as mock_settings:
+            mock_settings.AWX_COLLECTIONS_ENABLED = True
+            mock_settings.AWX_ROLES_ENABLED = False
+            jobs.RunProjectUpdate.make_local_copy(project, str(job_dir))
+
+        # Should use direct cache, not reqcache
+        dest = job_dir / 'requirements_collections' / 'direct.txt'
+        assert dest.exists()
+        assert dest.read_text() == 'direct content'
 
 
 @pytest.mark.parametrize('injector_cls', [cls for cls in ManagedCredentialType.registry.values() if cls.injectors])
@@ -1978,7 +2443,7 @@ def test_managed_injector_redaction(injector_cls):
     assert 'very_secret_value' not in str(build_safe_env(env))
 
 
-def test_job_run_no_ee(mock_me, mock_create_partition):
+def test_job_run_no_ee(mock_me, mock_create_partition, private_data_dir):
     org = Organization(pk=1)
     proj = Project(pk=1, organization=org)
     job = Job(project=proj, organization=org, inventory=Inventory(pk=1))
@@ -2008,7 +2473,7 @@ def test_project_update_no_ee(mock_me):
     with pytest.raises(RuntimeError) as e:
         task.build_env(job, {})
 
-    assert 'The project could not sync because there is no Execution Environment' in str(e.value)
+    assert 'The ProjectUpdate could not run because there is no Execution Environment' in str(e.value)
 
 
 @pytest.mark.parametrize(

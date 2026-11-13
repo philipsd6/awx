@@ -16,8 +16,7 @@ from django.test.utils import override_settings
 @pytest.mark.django_db
 def test_get_notification_template_list(get, user, notification_template):
     url = reverse('api:notification_template_list')
-    response = get(url, user('admin', True))
-    assert response.status_code == 200
+    response = get(url, user('admin', True), expect=200)
     assert len(response.data['results']) == 1
 
 
@@ -35,8 +34,8 @@ def test_basic_parameterization(get, post, user, organization):
             notification_configuration=dict(url="http://localhost", disable_ssl_verification=False, headers={"Test": "Header"}),
         ),
         u,
+        expect=201,
     )
-    assert response.status_code == 201
     url = reverse('api:notification_template_detail', kwargs={'pk': response.data['id']})
     response = get(url, u)
     assert 'related' in response.data
@@ -69,8 +68,8 @@ def test_encrypted_subfields(get, post, user, organization):
             notification_configuration=dict(account_sid="dummy", account_token="shouldhide", from_number="+19999999999", to_numbers=["9998887777"]),
         ),
         u,
+        expect=201,
     )
-    assert response.status_code == 201
     notification_template_actual = NotificationTemplate.objects.get(id=response.data['id'])
     url = reverse('api:notification_template_detail', kwargs={'pk': response.data['id']})
     response = get(url, u)
@@ -96,8 +95,8 @@ def test_inherited_notification_templates(get, post, user, organization, project
                 notification_configuration=dict(url="http://localhost", disable_ssl_verification=False, headers={"Test": "Header"}),
             ),
             u,
+            expect=201,
         )
-        assert response.status_code == 201
         notification_templates.append(response.data['id'])
     i = Inventory.objects.create(name='test', organization=organization)
     i.save()
@@ -113,6 +112,20 @@ def test_notification_template_simple_patch(patch, notification_template, admin)
 
 
 @pytest.mark.django_db
+def test_notification_template_patch_rejects_unsafe_name(patch, notification_template, admin):
+    """Name-only PATCH omits notification_configuration; that branch must still
+    chain into CleanTextMixin.validate() (AAP-78694)."""
+    with mock.patch('ansible_base.lib.serializers.mixins.get_setting', return_value=True):
+        response = patch(
+            reverse('api:notification_template_detail', kwargs={'pk': notification_template.id}),
+            {'name': '<script>x</script>'},
+            admin,
+            expect=400,
+        )
+    assert 'name' in response.data
+
+
+@pytest.mark.django_db
 def test_notification_template_invalid_notification_type(patch, notification_template, admin):
     patch(reverse('api:notification_template_detail', kwargs={'pk': notification_template.id}), {'notification_type': 'invalid'}, admin, expect=400)
 
@@ -122,8 +135,7 @@ def test_disallow_delete_when_notifications_pending(delete, user, notification_t
     u = user('superuser', True)
     url = reverse('api:notification_template_detail', kwargs={'pk': notification_template.id})
     Notification.objects.create(notification_template=notification_template, status='pending')
-    response = delete(url, user=u)
-    assert response.status_code == 405
+    delete(url, user=u, expect=405)
 
 
 @pytest.mark.django_db
@@ -133,9 +145,8 @@ def test_notification_template_list_includes_notification_errors(get, user, noti
     Notification.objects.create(notification_template=notification_template, status='successful')
     url = reverse('api:notification_template_list')
     u = user('superuser', True)
-    response = get(url, user=u)
+    response = get(url, user=u, expect=200)
 
-    assert response.status_code == 200
     notifications = response.data['results'][0]['summary_fields']['recent_notifications']
     assert len(notifications) == 3
     statuses = [n['status'] for n in notifications]
@@ -163,12 +174,14 @@ def test_custom_environment_injection(post, user, organization):
             notification_configuration=dict(url="https://example.org", disable_ssl_verification=False, http_method="POST", headers={"Test": "Header"}),
         ),
         u,
+        expect=201,
     )
-    assert response.status_code == 201
     template = NotificationTemplate.objects.get(pk=response.data['id'])
-    with pytest.raises(ConnectionError), override_settings(AWX_TASK_ENV={'HTTPS_PROXY': '192.168.50.100:1234'}), mock.patch.object(
-        HTTPAdapter, 'send'
-    ) as fake_send:
+    with (
+        pytest.raises(ConnectionError),
+        override_settings(AWX_TASK_ENV={'HTTPS_PROXY': '192.168.50.100:1234'}),
+        mock.patch.object(HTTPAdapter, 'send') as fake_send,
+    ):
 
         def _send_side_effect(request, **kw):
             assert select_proxy(request.url, kw['proxies']) == '192.168.50.100:1234'
@@ -195,8 +208,9 @@ def mock_post(*args, **kwargs):
 
 
 @pytest.mark.django_db
+@mock.patch('awx.main.notifications.webhook_backend.validate_url', side_effect=lambda url: url)
 @mock.patch('requests.post', side_effect=mock_post)
-def test_webhook_notification_pointed_to_a_redirect_launch_endpoint(post, admin, organization):
+def test_webhook_notification_pointed_to_a_redirect_launch_endpoint(post, mock_validate, admin, organization):
     n1 = NotificationTemplate.objects.create(
         name="test-webhook",
         description="test webhook",
@@ -218,3 +232,31 @@ def test_webhook_notification_pointed_to_a_redirect_launch_endpoint(post, admin,
     )
 
     assert n1.send("", n1.messages.get("success").get("body")) == 1
+
+
+@pytest.mark.django_db
+def test_update_notification_template(admin, notification_template):
+    notification_template.messages['workflow_approval'] = {
+        "running": {
+            "message": None,
+            "body": None,
+        }
+    }
+    notification_template.save()
+
+    workflow_approval_message = {
+        "approved": {
+            "message": None,
+            "body": None,
+        },
+        "running": {
+            "message": "test-message",
+            "body": None,
+        },
+    }
+    notification_template.messages['workflow_approval'] = workflow_approval_message
+    notification_template.save()
+
+    subevents = sorted(notification_template.messages["workflow_approval"].keys())
+    assert subevents == ["approved", "running"]
+    assert notification_template.messages['workflow_approval'] == workflow_approval_message

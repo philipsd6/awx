@@ -12,9 +12,11 @@ from django.utils.text import Truncator
 from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ValidationError
 
+from ansible_base.lib.utils.models import prevent_search
+
 # AWX
 from awx.api.versioning import reverse
-from awx.main.models.base import prevent_search, AD_HOC_JOB_TYPE_CHOICES, VERBOSITY_CHOICES, VarsDictProperty
+from awx.main.models.base import AD_HOC_JOB_TYPE_CHOICES, VERBOSITY_CHOICES, VarsDictProperty
 from awx.main.models.events import AdHocCommandEvent, UnpartitionedAdHocCommandEvent
 from awx.main.models.unified_jobs import UnifiedJob
 from awx.main.models.notifications import JobNotificationMixin, NotificationTemplate
@@ -159,7 +161,7 @@ class AdHocCommand(UnifiedJob, JobNotificationMixin):
         return reverse('api:ad_hoc_command_detail', kwargs={'pk': self.pk}, request=request)
 
     def get_ui_url(self):
-        return urljoin(settings.TOWER_URL_BASE, "/#/jobs/command/{}".format(self.pk))
+        return urljoin(settings.TOWER_URL_BASE, "{}/jobs/command/{}".format(settings.OPTIONAL_UI_URL_PREFIX, self.pk))
 
     @property
     def notification_templates(self):
@@ -209,7 +211,7 @@ class AdHocCommand(UnifiedJob, JobNotificationMixin):
         return AdHocCommand.objects.create(**data)
 
     def save(self, *args, **kwargs):
-        update_fields = kwargs.get('update_fields', [])
+        update_fields = kwargs.get('update_fields') or []
 
         def add_to_update_fields(name):
             if name not in update_fields:
@@ -219,7 +221,7 @@ class AdHocCommand(UnifiedJob, JobNotificationMixin):
             self.preferred_instance_groups_cache = self._get_preferred_instance_group_cache()
             add_to_update_fields("preferred_instance_groups_cache")
         if not self.name:
-            self.name = Truncator(u': '.join(filter(None, (self.module_name, self.module_args)))).chars(512)
+            self.name = Truncator(': '.join(filter(None, (self.module_name, self.module_args)))).chars(512)
             add_to_update_fields("name")
         if self.task_impact == 0:
             self.task_impact = self._get_task_impact()

@@ -94,17 +94,18 @@ def test_instance_dup(org_admin, organization, project, instance_factory, instan
 
     ig_all = instance_group_factory("all", instances=[i1, i2, i3])
     ig_dup = instance_group_factory("duplicates", instances=[i1])
-    project.organization.instance_groups.add(ig_all, ig_dup)
+    project.organization.instance_groups.add(ig_all)
+    project.organization.instance_groups.add(ig_dup)
     actual_num_instances = Instance.objects.count()
     list_response = get(reverse('api:instance_list'), user=system_auditor)
     api_num_instances_auditor = list(list_response.data.items())[0][1]
 
+    ig_all.read_role.members.add(org_admin)
     list_response2 = get(reverse('api:instance_list'), user=org_admin)
     api_num_instances_oa = list(list_response2.data.items())[0][1]
 
     assert api_num_instances_auditor == actual_num_instances
-    # Note: The org_admin will not see the default 'tower' node
-    # (instance fixture) because it is not in its group, as expected
+    # Note: The org_admin will not see instances unless at least read_role to the IG has been assigned
     assert api_num_instances_oa == (actual_num_instances - 1)
 
 
@@ -284,6 +285,20 @@ def test_control_plane_policy_exception(controlplane_instance_group):
     Instance.objects.create(hostname='foo-1', node_type='execution')
     apply_cluster_membership_policies()
     assert 'foo-1' not in [inst.hostname for inst in controlplane_instance_group.instances.all()]
+
+
+@pytest.mark.django_db
+def test_policy_instance_list_controlplane_excludes_execution_node(controlplane_instance_group):
+    controlplane_instance_group.policy_instance_percentage = 100
+    controlplane_instance_group.save()
+    exec_inst = Instance.objects.create(hostname='exec-1', node_type='execution')
+    control_inst = Instance.objects.create(hostname='control-1', node_type='control')
+    controlplane_instance_group.policy_instance_list = [exec_inst.hostname]
+    controlplane_instance_group.save()
+    apply_cluster_membership_policies()
+    members = list(controlplane_instance_group.instances.all())
+    assert exec_inst not in members
+    assert control_inst in members
 
 
 @pytest.mark.django_db

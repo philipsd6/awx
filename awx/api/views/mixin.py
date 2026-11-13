@@ -4,7 +4,8 @@
 import dateutil
 import logging
 
-from django.db.models import Count
+from django.db.models import Count, Q, TextField
+from django.db.models.functions import Cast
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils.timezone import now
@@ -15,6 +16,8 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from awx.main.constants import ACTIVE_STATES
+from ansible_base.rbac.models import RoleDefinition, RoleUserAssignment
+from awx.main.models import Organization
 from awx.main.utils import get_object_or_400
 from awx.main.models.ha import Instance, InstanceGroup, schedule_policy_task
 from awx.main.models.organization import Team
@@ -50,7 +53,7 @@ class UnifiedJobDeletionMixin(object):
                 return Response({"error": _("Job has not finished processing events.")}, status=status.HTTP_400_BAD_REQUEST)
             else:
                 # if it has been > 1 minute, events are probably lost
-                logger.warning('Allowing deletion of {} through the API without all events ' 'processed.'.format(obj.log_format))
+                logger.warning('Allowing deletion of {} through the API without all events processed.'.format(obj.log_format))
 
         # Manually cascade delete events if unpartitioned job
         if obj.has_unpartitioned_events:
@@ -58,6 +61,21 @@ class UnifiedJobDeletionMixin(object):
 
         obj.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class OrganizationInstanceGroupMembershipMixin(object):
+    """
+    This mixin overloads attach/detach so that it calls Organization.save(),
+    to ensure instance group updates are persisted
+    """
+
+    def unattach(self, request, *args, **kwargs):
+        with transaction.atomic():
+            organization_queryset = Organization.objects.select_for_update()
+            organization = organization_queryset.get(pk=self.get_parent_object().id)
+            response = super(OrganizationInstanceGroupMembershipMixin, self).unattach(request, *args, **kwargs)
+            organization.save()
+            return response
 
 
 class InstanceGroupMembershipMixin(object):
@@ -139,32 +157,25 @@ class OrganizationCountsMixin(object):
             return full_context
 
         db_results = {}
-        org_qs = self.model.accessible_objects(self.request.user, 'read_role')
+        org_qs = self.model.access_qs(self.request.user, 'view')
         org_id_list = org_qs.values('id')
         if len(org_id_list) == 0:
             if self.request.method == 'POST':
                 full_context['related_field_counts'] = {}
             return full_context
 
-        inv_qs = Inventory.accessible_objects(self.request.user, 'read_role')
-        project_qs = Project.accessible_objects(self.request.user, 'read_role')
-        jt_qs = JobTemplate.accessible_objects(self.request.user, 'read_role')
+        inv_qs = Inventory.access_qs(self.request.user, 'view')
+        project_qs = Project.access_qs(self.request.user, 'view')
+        jt_qs = JobTemplate.access_qs(self.request.user, 'view')
 
         # Produce counts of Foreign Key relationships
         db_results['inventories'] = inv_qs.values('organization').annotate(Count('organization')).order_by('organization')
 
-        db_results['teams'] = (
-            Team.accessible_objects(self.request.user, 'read_role').values('organization').annotate(Count('organization')).order_by('organization')
-        )
+        db_results['teams'] = Team.access_qs(self.request.user, 'view').values('organization').annotate(Count('organization')).order_by('organization')
 
         db_results['job_templates'] = jt_qs.values('organization').annotate(Count('organization')).order_by('organization')
 
         db_results['projects'] = project_qs.values('organization').annotate(Count('organization')).order_by('organization')
-
-        # Other members and admins of organization are always viewable
-        db_results['users'] = org_qs.annotate(users=Count('member_role__members', distinct=True), admins=Count('admin_role__members', distinct=True)).values(
-            'id', 'users', 'admins'
-        )
 
         count_context = {}
         for org in org_id_list:
@@ -172,18 +183,31 @@ class OrganizationCountsMixin(object):
             count_context[org_id] = {'inventories': 0, 'teams': 0, 'users': 0, 'job_templates': 0, 'admins': 0, 'projects': 0}
 
         for res, count_qs in db_results.items():
-            if res == 'users':
-                org_reference = 'id'
-            else:
-                org_reference = 'organization'
             for entry in count_qs:
-                org_id = entry[org_reference]
+                org_id = entry['organization']
                 if org_id in count_context:
-                    if res == 'users':
-                        count_context[org_id]['admins'] = entry['admins']
-                        count_context[org_id]['users'] = entry['users']
-                        continue
-                    count_context[org_id][res] = entry['%s__count' % org_reference]
+                    count_context[org_id][res] = entry['organization__count']
+
+        member_rd = RoleDefinition.objects.filter(name='Organization Member').first()
+        admin_rd = RoleDefinition.objects.filter(name='Organization Admin').first()
+
+        if member_rd and admin_rd:
+            user_admin_counts = (
+                RoleUserAssignment.objects.filter(
+                    role_definition__in=[member_rd, admin_rd],
+                    object_id__in=org_qs.annotate(text_pk=Cast('pk', TextField())).values('text_pk'),
+                )
+                .values('object_id')
+                .annotate(
+                    users=Count('pk', filter=Q(role_definition=member_rd)),
+                    admins=Count('pk', filter=Q(role_definition=admin_rd)),
+                )
+            )
+            for entry in user_admin_counts:
+                org_id = int(entry['object_id'])
+                if org_id in count_context:
+                    count_context[org_id]['users'] = entry['users']
+                    count_context[org_id]['admins'] = entry['admins']
 
         full_context['related_field_counts'] = count_context
 
@@ -196,3 +220,9 @@ class NoTruncateMixin(object):
         if self.request.query_params.get('no_truncate'):
             context.update(no_truncate=True)
         return context
+
+
+class UnifiedJobExcludeMixin(object):
+    # Reserve the name 'exclude' so we can use it as a query param. Otherwise, the rest-filters backend
+    # would treat it as a model field lookup.
+    rest_filters_reserved_names = ('exclude',)

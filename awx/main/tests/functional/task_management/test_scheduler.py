@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from awx.main.scheduler import TaskManager, DependencyManager, WorkflowManager
 from awx.main.utils import encrypt_field
-from awx.main.models import WorkflowJobTemplate, JobTemplate, Job
+from awx.main.models import WorkflowJobTemplate, JobTemplate, Job, Project, InventorySource, Inventory
 from awx.main.models.ha import Instance
 from . import create_job
 from django.conf import settings
@@ -16,9 +16,9 @@ def test_single_job_scheduler_launch(hybrid_instance, controlplane_instance_grou
     instance = controlplane_instance_group.instances.all()[0]
     objects = job_template_factory('jt', organization='org1', project='proj', inventory='inv', credential='cred')
     j = create_job(objects.job_template)
-    with mocker.patch("awx.main.scheduler.TaskManager.start_task"):
-        TaskManager().schedule()
-        TaskManager.start_task.assert_called_once_with(j, controlplane_instance_group, instance)
+    mocker.patch("awx.main.scheduler.TaskManager.start_task")
+    TaskManager().schedule()
+    TaskManager.start_task.assert_called_once_with(j, controlplane_instance_group, instance)
 
 
 @pytest.mark.django_db
@@ -331,15 +331,13 @@ def test_single_job_dependencies_project_launch(controlplane_instance_group, job
     p.save(skip_update=True)
     with mock.patch("awx.main.scheduler.TaskManager.start_task"):
         dm = DependencyManager()
-        with mock.patch.object(DependencyManager, "create_project_update", wraps=dm.create_project_update) as mock_pu:
-            dm.schedule()
-            mock_pu.assert_called_once_with(j)
-            pu = [x for x in p.project_updates.all()]
-            assert len(pu) == 1
-            TaskManager().schedule()
-            TaskManager.start_task.assert_called_once_with(pu[0], controlplane_instance_group, instance)
-            pu[0].status = "successful"
-            pu[0].save()
+        dm.schedule()
+        pu = [x for x in p.project_updates.all()]
+        assert len(pu) == 1
+        TaskManager().schedule()
+        TaskManager.start_task.assert_called_once_with(pu[0], controlplane_instance_group, instance)
+        pu[0].status = "successful"
+        pu[0].save()
     with mock.patch("awx.main.scheduler.TaskManager.start_task"):
         TaskManager().schedule()
         TaskManager.start_task.assert_called_once_with(j, controlplane_instance_group, instance)
@@ -359,22 +357,21 @@ def test_single_job_dependencies_inventory_update_launch(controlplane_instance_g
     i.inventory_sources.add(ii)
     with mock.patch("awx.main.scheduler.TaskManager.start_task"):
         dm = DependencyManager()
-        with mock.patch.object(DependencyManager, "create_inventory_update", wraps=dm.create_inventory_update) as mock_iu:
-            dm.schedule()
-            mock_iu.assert_called_once_with(j, ii)
-            iu = [x for x in ii.inventory_updates.all()]
-            assert len(iu) == 1
-            TaskManager().schedule()
-            TaskManager.start_task.assert_called_once_with(iu[0], controlplane_instance_group, instance)
-            iu[0].status = "successful"
-            iu[0].save()
+        dm.schedule()
+        assert ii.inventory_updates.count() == 1
+        iu = [x for x in ii.inventory_updates.all()]
+        assert len(iu) == 1
+        TaskManager().schedule()
+        TaskManager.start_task.assert_called_once_with(iu[0], controlplane_instance_group, instance)
+        iu[0].status = "successful"
+        iu[0].save()
     with mock.patch("awx.main.scheduler.TaskManager.start_task"):
         TaskManager().schedule()
         TaskManager.start_task.assert_called_once_with(j, controlplane_instance_group, instance)
 
 
 @pytest.mark.django_db
-def test_inventory_update_launches_project_update(controlplane_instance_group, scm_inventory_source):
+def test_inventory_update_launches_project_update(scm_inventory_source):
     ii = scm_inventory_source
     project = scm_inventory_source.source_project
     project.scm_update_on_launch = True
@@ -382,11 +379,51 @@ def test_inventory_update_launches_project_update(controlplane_instance_group, s
     iu = ii.create_inventory_update()
     iu.status = "pending"
     iu.save()
+    assert project.project_updates.count() == 0
     with mock.patch("awx.main.scheduler.TaskManager.start_task"):
         dm = DependencyManager()
-        with mock.patch.object(DependencyManager, "create_project_update", wraps=dm.create_project_update) as mock_pu:
-            dm.schedule()
-            mock_pu.assert_called_with(iu, project_id=project.id)
+        dm.schedule()
+    assert project.project_updates.count() == 1
+
+
+@pytest.mark.django_db
+def test_dependency_isolation(organization):
+    """Spawning both a job project update dependency, and an inventory update project dependency
+
+    this should keep dependencies isolated"""
+    with mock.patch('awx.main.models.unified_jobs.UnifiedJobTemplate.update'):
+        updating_projects = [
+            Project.objects.create(name=f'iso-proj{i}', organization=organization, scm_url='https://foo.invalid', scm_type='git', scm_update_on_launch=True)
+            for i in range(2)
+        ]
+
+        inv_src = InventorySource.objects.create(
+            name='iso-inv',
+            organization=organization,
+            source_project=updating_projects[0],
+            source='scm',
+            inventory=Inventory.objects.create(name='for-inv-src', organization=organization),
+        )
+
+        inv_update = inv_src.create_unified_job()
+        inv_update.signal_start()
+        assert not inv_update.dependent_jobs.exists()
+
+        jt = JobTemplate.objects.create(
+            project=updating_projects[1],
+            inventory=Inventory.objects.create(name='one-off', organization=organization),  # non-updating inventory source
+        )
+        job = jt.create_unified_job()
+        job.signal_start()
+        assert not job.dependent_jobs.exists()
+
+        dm = DependencyManager()
+        dm.schedule()
+
+        # in a single run, the completely unrelated inventory and jobs are linked to their own dependencies
+        assert (inv_update.dependent_jobs.count(), job.dependent_jobs.count()) == (1, 1)
+        assert inv_update.dependent_jobs.first().project == updating_projects[0]
+        assert job.dependent_jobs.first().project == updating_projects[1]
 
 
 @pytest.mark.django_db
@@ -407,12 +444,63 @@ def test_job_dependency_with_already_updated(controlplane_instance_group, job_te
     j.save()
     with mock.patch("awx.main.scheduler.TaskManager.start_task"):
         dm = DependencyManager()
-        with mock.patch.object(DependencyManager, "create_inventory_update", wraps=dm.create_inventory_update) as mock_iu:
-            dm.schedule()
-            mock_iu.assert_not_called()
+        dm.schedule()
+        assert ii.inventory_updates.count() == 0
     with mock.patch("awx.main.scheduler.TaskManager.start_task"):
         TaskManager().schedule()
         TaskManager.start_task.assert_called_once_with(j, controlplane_instance_group, instance)
+
+
+@pytest.mark.django_db
+def test_undecryptable_start_args_does_not_freeze_scheduler(controlplane_instance_group, job_template_factory):
+    """
+    A single pending job whose start_args cannot be decrypted with the
+    current SECRET_KEY (e.g. restored from a different environment) must not
+    crash DependencyManager and must not prevent every other pending job in
+    the same batch from being marked dependencies_processed.
+    """
+    objects = job_template_factory('jt', organization='org1', project='proj', inventory='inv', credential='cred')
+
+    bad_job = create_job(objects.job_template, dependencies_processed=False)
+    bad_job.start_args = json.dumps({'inventory_sources_already_updated': []})
+    bad_job.start_args = encrypt_field(bad_job, field_name='start_args', secret_key='a-different-environments-secret-key')
+    bad_job.save(update_fields=['start_args'])
+
+    good_job = create_job(objects.job_template, dependencies_processed=False)
+
+    dm = DependencyManager()
+    dm.schedule()  # must not raise cryptography.fernet.InvalidToken
+
+    bad_job.refresh_from_db()
+    good_job.refresh_from_db()
+    assert bad_job.dependencies_processed is True
+    assert good_job.dependencies_processed is True
+
+
+@pytest.mark.django_db
+def test_workflow_job_undecryptable_start_args_does_not_block_spawn(inventory, project, controlplane_instance_group):
+    """
+    A running workflow job whose start_args cannot be decrypted with the
+    current SECRET_KEY must not crash WorkflowManager and must not prevent
+    its ready-to-run node from being spawned.
+    """
+    jt = JobTemplate.objects.create(inventory=inventory, project=project, playbook='helloworld.yml')
+    wfjt = WorkflowJobTemplate.objects.create(name='wfjt-aap-90155')
+    wfjt.workflow_nodes.create(unified_job_template=jt)
+
+    wj = wfjt.create_unified_job()
+    wj.signal_start()
+    TaskManager().schedule()  # transitions wj from pending to running
+    wj.refresh_from_db()
+    assert wj.status == 'running'
+
+    wj.start_args = json.dumps({})
+    wj.start_args = encrypt_field(wj, field_name='start_args', secret_key='a-different-environments-secret-key')
+    wj.save(update_fields=['start_args'])
+
+    WorkflowManager().schedule()  # must not raise cryptography.fernet.InvalidToken
+
+    assert jt.jobs.count() == 1  # node's job was still spawned
 
 
 @pytest.mark.django_db
@@ -442,7 +530,9 @@ def test_shared_dependencies_launch(controlplane_instance_group, job_template_fa
         TaskManager().schedule()
         pu = p.project_updates.first()
         iu = ii.inventory_updates.first()
-        TaskManager.start_task.assert_has_calls([mock.call(iu, controlplane_instance_group, instance), mock.call(pu, controlplane_instance_group, instance)])
+        TaskManager.start_task.assert_has_calls(
+            [mock.call(iu, controlplane_instance_group, instance), mock.call(pu, controlplane_instance_group, instance)], any_order=True
+        )
         pu.status = "successful"
         pu.finished = pu.created + timedelta(seconds=1)
         pu.save()
@@ -451,7 +541,9 @@ def test_shared_dependencies_launch(controlplane_instance_group, job_template_fa
         iu.save()
     with mock.patch("awx.main.scheduler.TaskManager.start_task"):
         TaskManager().schedule()
-        TaskManager.start_task.assert_has_calls([mock.call(j1, controlplane_instance_group, instance), mock.call(j2, controlplane_instance_group, instance)])
+        TaskManager.start_task.assert_has_calls(
+            [mock.call(j1, controlplane_instance_group, instance), mock.call(j2, controlplane_instance_group, instance)], any_order=True
+        )
     pu = [x for x in p.project_updates.all()]
     iu = [x for x in ii.inventory_updates.all()]
     assert len(pu) == 1

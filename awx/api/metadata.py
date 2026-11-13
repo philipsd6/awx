@@ -23,6 +23,7 @@ from rest_framework.request import clone_request
 
 # AWX
 from awx.api.fields import ChoiceNullField
+from awx.api.validation_patterns import build_survey_spec_options_schema, inject_patterns_into_init_parameters, inject_top_level_clean_text_patterns
 from awx.main.fields import ImplicitRoleField
 from awx.main.models import NotificationTemplate
 from awx.main.utils.execution_environments import get_default_pod_spec
@@ -36,11 +37,13 @@ class Metadata(metadata.SimpleMetadata):
         field_info = OrderedDict()
         field_info['type'] = self.label_lookup[field]
         field_info['required'] = getattr(field, 'required', False)
+        field_info['hidden'] = getattr(field, 'hidden', False)
 
         text_attrs = [
             'read_only',
             'label',
             'help_text',
+            'warning_text',
             'min_length',
             'max_length',
             'min_value',
@@ -71,7 +74,7 @@ class Metadata(metadata.SimpleMetadata):
                 'url': _('URL for this {}.'),
                 'related': _('Data structure with URLs of related resources.'),
                 'summary_fields': _(
-                    'Data structure with name/description for related resources.  ' 'The output for some objects may be limited for performance reasons.'
+                    'Data structure with name/description for related resources.  The output for some objects may be limited for performance reasons.'
                 ),
                 'created': _('Timestamp when this {} was created.'),
                 'modified': _('Timestamp when this {} was last modified.'),
@@ -101,7 +104,7 @@ class Metadata(metadata.SimpleMetadata):
             default = field.get_default()
             if type(default) is UUID:
                 default = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-            if field.field_name == 'TOWER_URL_BASE' and default == 'https://towerhost':
+            if field.field_name == 'TOWER_URL_BASE' and default == 'https://platformhost':
                 default = '{}://{}'.format(self.request.scheme, self.request.get_host())
             field_info['default'] = default
         except serializers.SkipField:
@@ -129,7 +132,9 @@ class Metadata(metadata.SimpleMetadata):
         # are conditional on the type selected.
         if field.field_name == 'notification_configuration':
             for notification_type_name, notification_tr_name, notification_type_class in NotificationTemplate.NOTIFICATION_TYPES:
-                field_info[notification_type_name] = notification_type_class.init_parameters
+                # Copy before injecting patterns so class-level init_parameters
+                # dicts are never mutated (AAP-87586).
+                field_info[notification_type_name] = inject_patterns_into_init_parameters(notification_type_class.init_parameters)
 
         # Special handling of notification messages where the required properties
         # are conditional on the type selected.
@@ -169,13 +174,16 @@ class Metadata(metadata.SimpleMetadata):
         ):
             field_info['type'] = 'json'
         elif (
-            isinstance(field, ManyRelatedField)
-            and field.field_name == 'credentials'
+            isinstance(field, ManyRelatedField) and field.field_name == 'credentials'
             # launch-time credentials
         ):
             field_info['type'] = 'list_of_ids'
         elif isinstance(model_field, BooleanField):
             field_info['type'] = 'boolean'
+
+        # Advertise CleanTextMixin Tier 1/Tier 2 patterns on top-level CharFields (AAP-87586).
+        # No-op unless ENHANCED_INPUT_VALIDATION_ENABLED is on and the serializer mixes in CleanTextMixin.
+        field_info = inject_top_level_clean_text_patterns(field, field_info)
 
         return field_info
 
@@ -238,6 +246,11 @@ class Metadata(metadata.SimpleMetadata):
                         if field == 'id' and hasattr(view, 'attach'):
                             continue
                         actions[method].pop(field)
+
+        # Survey spec uses EmptySerializer, so POST has no field metadata unless we
+        # supply the JSON sub-key catalog (AAP-87586).
+        if getattr(view, 'advertises_survey_spec_schema', False) and 'POST' in actions:
+            actions['POST'] = build_survey_spec_options_schema()
 
         return actions
 

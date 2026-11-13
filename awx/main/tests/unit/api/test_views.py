@@ -5,6 +5,8 @@ from unittest import mock
 
 from collections import namedtuple
 
+from django.test import override_settings
+
 from awx.api.views.root import ApiVersionRootView
 from awx.api.views import JobTemplateLabelList, InventoryInventorySourcesUpdate, JobTemplateSurveySpec
 
@@ -50,6 +52,7 @@ class TestApiRootView:
             'activity_stream',
             'workflow_job_templates',
             'workflow_jobs',
+            'analytics',
         ]
         view = ApiVersionRootView()
         ret = view.get(mocker.MagicMock())
@@ -65,7 +68,7 @@ class TestJobTemplateLabelList:
             mock_request = mock.MagicMock()
 
             super(JobTemplateLabelList, view).unattach(mock_request, None, None)
-            assert mixin_unattach.called_with(mock_request, None, None)
+            mixin_unattach.assert_called_with(mock_request, None, None)
 
 
 class TestInventoryInventorySourcesUpdate:
@@ -107,15 +110,16 @@ class TestInventoryInventorySourcesUpdate:
         mock_request = mocker.MagicMock()
         mock_request.user.can_access.return_value = can_access
 
-        with mocker.patch.object(InventoryInventorySourcesUpdate, 'get_object', return_value=obj):
-            with mocker.patch.object(InventoryInventorySourcesUpdate, 'get_serializer_context', return_value=None):
-                with mocker.patch('awx.api.serializers.InventoryUpdateDetailSerializer') as serializer_class:
-                    serializer = serializer_class.return_value
-                    serializer.to_representation.return_value = {}
+        mocker.patch.object(InventoryInventorySourcesUpdate, 'get_object', return_value=obj)
+        mocker.patch.object(InventoryInventorySourcesUpdate, 'get_serializer_context', return_value=None)
+        serializer_class = mocker.patch('awx.api.serializers.InventoryUpdateDetailSerializer')
 
-                    view = InventoryInventorySourcesUpdate()
-                    response = view.post(mock_request)
-                    assert response.data == expected
+        serializer = serializer_class.return_value
+        serializer.to_representation.return_value = {}
+
+        view = InventoryInventorySourcesUpdate()
+        response = view.post(mock_request)
+        assert response.data == expected
 
 
 class TestSurveySpecValidation:
@@ -276,9 +280,9 @@ class TestSurveySpecValidation:
             ({'type': 'password', 'default': ['some', 'invalid', 'list']}, 'expected to be string'),
             ({'type': 'password', 'default': False}, 'expected to be string'),
             ({'type': 'integer', 'default': 'foo'}, 'expected to be int'),
-            ({'type': 'integer', 'default': u'🐉'}, 'expected to be int'),
+            ({'type': 'integer', 'default': '🐉'}, 'expected to be int'),
             ({'type': 'foo'}, 'allowed question types'),
-            ({'type': u'🐉'}, 'allowed question types'),
+            ({'type': '🐉'}, 'allowed question types'),
             ({'type': 'multiplechoice'}, 'multiplechoice must specify choices'),
             ({'type': 'integer', 'min': 'foo'}, 'min limit in survey question 0 expected to be integer'),
             ({'question_name': 42}, "'question_name' in survey question 0 expected to be string."),
@@ -314,4 +318,18 @@ class TestSurveySpecValidation:
         """Assert that empty default is allowed for answer."""
         spec = self.spec_from_element({'type': _type, 'default': ''})
         r = JobTemplateSurveySpec._validate_spec_data(spec, {})
+        assert r is None
+
+    def test_rejects_markup_in_question_name_when_toggle_on(self):
+        spec = self.spec_from_element({'question_name': '<script>x</script>'})
+        with override_settings(ENHANCED_INPUT_VALIDATION_ENABLED=True):
+            r = JobTemplateSurveySpec._validate_spec_data(spec, {})
+        assert r is not None
+        assert r.status_code == 400
+        assert 'spec[0].question_name' in r.data
+
+    def test_allows_markup_in_question_name_when_toggle_off(self):
+        spec = self.spec_from_element({'question_name': '<script>x</script>'})
+        with override_settings(ENHANCED_INPUT_VALIDATION_ENABLED=False):
+            r = JobTemplateSurveySpec._validate_spec_data(spec, {})
         assert r is None

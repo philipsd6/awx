@@ -11,7 +11,6 @@ import awxkit.exceptions as exc
 from . import base
 from . import page
 
-
 log = logging.getLogger(__name__)
 
 
@@ -125,14 +124,23 @@ class Inventory(HasCopy, HasCreate, HasInstanceGroups, HasVariables, base.Base):
         return inv_updates
 
 
-page.register_page([resources.inventory, (resources.inventories, 'post'), (resources.inventory_copy, 'post')], Inventory)
+page.register_page(
+    [
+        resources.inventory,
+        resources.constructed_inventory,
+        (resources.inventories, 'post'),
+        (resources.inventory_copy, 'post'),
+        (resources.constructed_inventories, 'post'),
+    ],
+    Inventory,
+)
 
 
 class Inventories(page.PageList, Inventory):
     pass
 
 
-page.register_page([resources.inventories, resources.related_inventories], Inventories)
+page.register_page([resources.inventories, resources.related_inventories, resources.constructed_inventories], Inventories)
 
 
 class Group(HasCreate, HasVariables, base.Base):
@@ -319,6 +327,7 @@ class InventorySource(HasCreate, HasNotifications, UnifiedJobTemplate):
         optional_fields = (
             'source_path',
             'source_vars',
+            'scm_branch',
             'timeout',
             'overwrite',
             'overwrite_vars',
